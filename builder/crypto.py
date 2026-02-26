@@ -250,25 +250,52 @@ class CryptoEngine:
     # ========================================================================
     
     def generate_cpp_keys(self) -> str:
-        """Generate C++ code for decryption keys"""
+        """Generate C++ code for decryption keys with build-time XOR obfuscation"""
         if self.keys is None:
             self.generate_keys()
         
         lines = []
         lines.append("// ============================================================================")
-        lines.append("// Decryption Keys (Auto-generated)")
+        lines.append("// Decryption Keys (Auto-generated, XOR-obfuscated at build time)")
         lines.append("// ============================================================================\n")
         
-        # XOR Key
-        xor_hex = ', '.join(f'0x{b:02X}' for b in self.keys.xor_key)
+        # Generate a random 1-byte seed for LCG obfuscation
+        seed = os.urandom(1)[0]
+        
+        def lcg_obfuscate(key_bytes: bytes, start_seed: int) -> tuple:
+            """XOR key bytes with evolving LCG seed; return obfuscated bytes and final seed"""
+            obf = bytearray(len(key_bytes))
+            s = start_seed
+            for i, b in enumerate(key_bytes):
+                obf[i] = b ^ s
+                s = (s * 0x41C64E6D + 0x3039) & 0xFF
+            return bytes(obf), s
+        
+        # Emit the seed and DeriveKeys function
+        lines.append(f"static BYTE g_KeySeed = 0x{seed:02X};")
+        lines.append("")
+        lines.append("static void DeriveKeys(PBYTE pObfuscatedKey, SIZE_T dwKeyLen) {")
+        lines.append("    // LCG parameters: multiplier and increment from MSVCRT rand() implementation")
+        lines.append("    for (SIZE_T i = 0; i < dwKeyLen; i++) {")
+        lines.append("        pObfuscatedKey[i] ^= g_KeySeed;")
+        lines.append("        g_KeySeed = (BYTE)((g_KeySeed * 0x41C64E6D + 0x3039) & 0xFF);")
+        lines.append("    }")
+        lines.append("}")
+        lines.append("")
+        
+        # Obfuscate XOR key at build time
+        xor_obf, seed = lcg_obfuscate(self.keys.xor_key, seed)
+        xor_hex = ', '.join(f'0x{b:02X}' for b in xor_obf)
         lines.append(f"unsigned char g_XorKey[] = {{ {xor_hex} }};")
         lines.append(f"SIZE_T g_XorKeyLen = {len(self.keys.xor_key)};")
         lines.append("")
         
         # AES Key (if available)
         if CRYPTO_AVAILABLE:
-            aes_key_hex = ', '.join(f'0x{b:02X}' for b in self.keys.aes_key)
-            aes_iv_hex = ', '.join(f'0x{b:02X}' for b in self.keys.aes_iv)
+            aes_key_obf, seed = lcg_obfuscate(self.keys.aes_key, seed)
+            aes_iv_obf, seed = lcg_obfuscate(self.keys.aes_iv, seed)
+            aes_key_hex = ', '.join(f'0x{b:02X}' for b in aes_key_obf)
+            aes_iv_hex = ', '.join(f'0x{b:02X}' for b in aes_iv_obf)
             
             lines.append(f"unsigned char g_AesKey[] = {{ {aes_key_hex} }};")
             lines.append(f"SIZE_T g_AesKeyLen = {len(self.keys.aes_key)};")
@@ -277,8 +304,18 @@ class CryptoEngine:
             lines.append(f"SIZE_T g_AesIvLen = {len(self.keys.aes_iv)};")
             lines.append("")
             lines.append("#define USE_AES_DECRYPTION 1")
+            lines.append("")
+            lines.append("static void DeriveAllKeys(void) {")
+            lines.append("    DeriveKeys(g_XorKey, g_XorKeyLen);")
+            lines.append("    DeriveKeys(g_AesKey, g_AesKeyLen);")
+            lines.append("    DeriveKeys(g_AesIv, g_AesIvLen);")
+            lines.append("}")
         else:
             lines.append("#define USE_AES_DECRYPTION 0")
+            lines.append("")
+            lines.append("static void DeriveAllKeys(void) {")
+            lines.append("    DeriveKeys(g_XorKey, g_XorKeyLen);")
+            lines.append("}")
         
         return '\n'.join(lines)
     
