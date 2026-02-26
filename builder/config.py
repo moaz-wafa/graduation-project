@@ -41,6 +41,8 @@ INJECT_THREADPOOL = INJECT_REMOTETHREAD  # Backward-compat alias
 INJECT_HOLLOWING = "hollowing"
 INJECT_MAPPING = "mapping"
 INJECT_THREADPOOL_REAL = "threadpool_real"
+INJECT_EARLYCASCADE = "earlycascade"
+INJECT_CALLBACK = "callback"
 
 # ============================================================================
 # Default Profile
@@ -52,7 +54,7 @@ DEFAULT_PROFILE = {
     "strings": STRINGS_DJB2,
     "encrypt": ENCRYPT_CASCADE,
     "encode": ENCODE_UUID,
-    "inject": INJECT_EARLYBIRD,
+    "inject": INJECT_EARLYCASCADE,
     "target": "notepad.exe",
     "sandbox": True,
     "etw": True,
@@ -64,6 +66,7 @@ DEFAULT_PROFILE = {
     "wipe_pe": True,
     "callstack_spoof": False,
     "dynapi": False,
+    "edr_freeze": False,
 }
 
 # ============================================================================
@@ -80,7 +83,7 @@ class BuildConfig:
     strings: str = STRINGS_DJB2
     encrypt: str = ENCRYPT_CASCADE
     encode: str = ENCODE_UUID
-    inject: str = INJECT_EARLYBIRD
+    inject: str = INJECT_EARLYCASCADE
     target: str = "notepad.exe"
     
     # Evasion options
@@ -92,6 +95,7 @@ class BuildConfig:
     wipe_pe: bool = True
     callstack_spoof: bool = False
     dynapi: bool = False
+    edr_freeze: bool = False
     
     # Runtime options
     sleep: int = 0
@@ -127,7 +131,7 @@ class BuildConfig:
         # Validate injection
         valid_inject = [INJECT_STOMP, INJECT_EARLYBIRD, INJECT_REMOTETHREAD,
                        "threadpool", INJECT_HOLLOWING, INJECT_MAPPING,
-                       INJECT_THREADPOOL_REAL]
+                       INJECT_THREADPOOL_REAL, INJECT_EARLYCASCADE, INJECT_CALLBACK]
         if self.inject not in valid_inject:
             return False, f"Invalid injection method: {self.inject}"
         
