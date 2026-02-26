@@ -36,7 +36,8 @@ ENCODE_RAW = "raw"
 
 INJECT_STOMP = "stomp"
 INJECT_EARLYBIRD = "earlybird"
-INJECT_THREADPOOL = "threadpool"
+INJECT_REMOTETHREAD = "remotethread"
+INJECT_THREADPOOL = INJECT_REMOTETHREAD  # Backward-compat alias
 INJECT_HOLLOWING = "hollowing"
 INJECT_MAPPING = "mapping"
 
@@ -113,8 +114,8 @@ class BuildConfig:
             return False, f"Invalid encoding: {self.encode}"
         
         # Validate injection
-        valid_inject = [INJECT_STOMP, INJECT_EARLYBIRD, INJECT_THREADPOOL, 
-                       INJECT_HOLLOWING, INJECT_MAPPING]
+        valid_inject = [INJECT_STOMP, INJECT_EARLYBIRD, INJECT_REMOTETHREAD,
+                       "threadpool", INJECT_HOLLOWING, INJECT_MAPPING]
         if self.inject not in valid_inject:
             return False, f"Invalid injection method: {self.inject}"
         
