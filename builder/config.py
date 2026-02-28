@@ -68,6 +68,7 @@ DEFAULT_PROFILE = {
     "dynapi": False,
     "edr_freeze": False,
     "edr_preload": False,
+    "freeze": False,
 }
 
 # ============================================================================
@@ -98,6 +99,7 @@ class BuildConfig:
     dynapi: bool = False
     edr_freeze: bool = False
     edr_preload: bool = False
+    freeze: bool = False
     
     # Runtime options
     sleep: int = 0

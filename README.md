@@ -93,6 +93,7 @@ The builder generates a self-contained C++ project (syscalls, resolver, injectio
 | `--etw` / `--no-etw` | — | enabled | ETW patching |
 | `--unhook` | — | disabled | NTDLL unhooking |
 | `--edr-freeze` | — | disabled | Freeze EDR processes (requires admin) |
+| `--freeze` | — | disabled | Freeze all remote threads before shellcode write |
 | `--debug` | — | disabled | Verbose debug output |
 
 ---
