@@ -67,6 +67,7 @@ DEFAULT_PROFILE = {
     "callstack_spoof": False,
     "dynapi": False,
     "edr_freeze": False,
+    "edr_preload": False,
 }
 
 # ============================================================================
@@ -96,6 +97,7 @@ class BuildConfig:
     callstack_spoof: bool = False
     dynapi: bool = False
     edr_freeze: bool = False
+    edr_preload: bool = False
     
     # Runtime options
     sleep: int = 0
@@ -138,6 +140,10 @@ class BuildConfig:
         # Validate input file
         if self.input_file and not os.path.exists(self.input_file):
             return False, f"Input file not found: {self.input_file}"
+        
+        # Validate edr_preload
+        if not isinstance(self.edr_preload, bool):
+            return False, f"edr_preload must be a bool"
         
         return True, "Configuration valid"
     
