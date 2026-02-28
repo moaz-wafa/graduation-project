@@ -112,6 +112,10 @@ class BuildConfig:
     sleep: int = 0
     debug: bool = False
     
+    # Advanced options
+    syscall_hash: bool = False
+    output_format: str = "pe"
+    
     # Input/Output
     input_file: str = ""
     output_file: str = "shadowgate.exe"
@@ -157,6 +161,10 @@ class BuildConfig:
         # Validate ppid_spoof
         if self.ppid_spoof and not self.ppid_spoof.lower().endswith('.exe'):
             return False, f"ppid_spoof must end with .exe"
+        
+        # Validate output_format
+        if self.output_format not in ["pe", "dll", "svc"]:
+            return False, f"Invalid output format: {self.output_format}"
         
         return True, "Configuration valid"
     

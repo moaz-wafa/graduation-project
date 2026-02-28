@@ -78,7 +78,8 @@ class MSVCCompiler:
                 libs: List[str] = None,
                 defines: List[str] = None,
                 debug: bool = False,
-                optimize: bool = True) -> bool:
+                optimize: bool = True,
+                output_format: str = "pe") -> bool:
         """
         Compile the project
         
@@ -92,6 +93,7 @@ class MSVCCompiler:
             defines: Preprocessor definitions
             debug: Build with debug info
             optimize: Enable optimizations
+            output_format: Output format: 'pe' (EXE), 'dll' (DLL), 'svc' (Service EXE)
         
         Returns:
             True if compilation successful
@@ -161,7 +163,11 @@ class MSVCCompiler:
         obj_list = ' '.join(f'"{o}"' for o in obj_files)
         lib_list = ' '.join(libs)
         
-        link_flags = '/nologo /SUBSYSTEM:CONSOLE /MACHINE:X64'
+        if output_format == 'dll':
+            # /DLL: build as DLL; /EXPORT:Run: export Run() for reflective/manual loaders
+            link_flags = '/nologo /DLL /MACHINE:X64 /EXPORT:Run'
+        else:
+            link_flags = '/nologo /SUBSYSTEM:CONSOLE /MACHINE:X64'
         if debug:
             link_flags += ' /DEBUG'
         else:
