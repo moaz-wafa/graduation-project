@@ -96,6 +96,9 @@ The builder generates a self-contained C++ project (syscalls, resolver, injectio
 | `--edr-preload` | — | disabled | Prevent EDR user-mode hooks via AvrfpAPILookupCallbackRoutine intercept |
 | `--disable-preloaded-edr` | — | disabled | Clobber EntryPoints of non-essential loaded DLLs to prevent EDR DllMain initialization |
 | `--freeze` | — | disabled | Freeze all remote threads before shellcode write |
+| `--spoof-cmdline` | — | disabled | Spoof command line in remote process PEB (hides real arguments from tools like Process Hacker) |
+| `--ppid-spoof <name>` | process name | disabled | Spoof parent PID by inheriting from named process (e.g. `explorer.exe`) |
+| `--block-dlls` | — | disabled | Block non-Microsoft-signed DLLs from loading into spawned process |
 | `--debug` | — | disabled | Verbose debug output |
 
 ---
