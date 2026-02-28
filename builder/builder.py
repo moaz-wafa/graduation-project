@@ -2487,6 +2487,9 @@ BOOL InjectThreadPoolReal(PINJECTION_CONTEXT pCtx) {
 // Thread Freeze / Thaw Helpers
 // ============================================================================
 
+// Suspends all threads in hProcess except dwMainThreadId (pass 0 to suspend all).
+// Uses a fresh snapshot; threads that terminate between snapshot and OpenThread
+// are silently skipped (OpenThread returns NULL for terminated threads).
 BOOL FreezeRemoteThreads(HANDLE hProcess, DWORD dwMainThreadId) {
     DWORD dwTargetPid = GetProcessId(hProcess);
     if (!dwTargetPid) return FALSE;
@@ -2519,6 +2522,8 @@ BOOL FreezeRemoteThreads(HANDLE hProcess, DWORD dwMainThreadId) {
     return TRUE;
 }
 
+// Resumes all threads in hProcess except dwMainThreadId (pass 0 to resume all).
+// Uses a fresh snapshot to avoid stale handles from the freeze pass.
 BOOL ThawRemoteThreads(HANDLE hProcess, DWORD dwMainThreadId) {
     DWORD dwTargetPid = GetProcessId(hProcess);
     if (!dwTargetPid) return FALSE;
