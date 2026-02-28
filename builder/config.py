@@ -69,6 +69,7 @@ DEFAULT_PROFILE = {
     "edr_freeze": False,
     "edr_preload": False,
     "freeze": False,
+    "disable_preloaded_edr": False,
 }
 
 # ============================================================================
@@ -100,6 +101,7 @@ class BuildConfig:
     edr_freeze: bool = False
     edr_preload: bool = False
     freeze: bool = False
+    disable_preloaded_edr: bool = False
     
     # Runtime options
     sleep: int = 0
