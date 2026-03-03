@@ -3657,6 +3657,7 @@ BOOL PerformInjection(PINJECTION_CONTEXT pCtx) {
 #include <windows.h>
 #include "common.h"
 #include "syscalls.h"
+#include "resolver.h"
 #include "injection.h"
 
 #ifdef __cplusplus
