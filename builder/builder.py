@@ -2630,6 +2630,31 @@ extern "C" void PrepareNextSyscall(DWORD dwIndex);
 #define PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON 0x100000000000ULL
 #endif
 
+// Fallback definitions in case these are not defined via main.cpp include
+#ifndef SPOOF_CMDLINE_STRING
+#define SPOOF_CMDLINE_STRING L"C:\\Windows\\System32\\svchost.exe -k netsvcs"
+#endif
+
+#ifndef PPID_SPOOF_TARGET
+#define PPID_SPOOF_TARGET L"explorer.exe"
+#endif
+
+#ifndef ENABLE_CMDLINE_SPOOF
+#define ENABLE_CMDLINE_SPOOF 0
+#endif
+
+#ifndef ENABLE_PPID_SPOOF
+#define ENABLE_PPID_SPOOF 0
+#endif
+
+#ifndef ENABLE_BLOCK_DLLS
+#define ENABLE_BLOCK_DLLS 0
+#endif
+
+#ifndef ENABLE_FREEZE
+#define ENABLE_FREEZE 0
+#endif
+
 // ============================================================================
 // Helper: Find Process by Name
 // ============================================================================
@@ -3673,6 +3698,31 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx);
 #include "earlycascade.h"
 #include <stdio.h>
 #include <intrin.h>
+
+// Fallback definitions in case these are not defined via main.cpp include
+#ifndef ENABLE_DISABLE_PRELOADED_EDR
+#define ENABLE_DISABLE_PRELOADED_EDR 0
+#endif
+
+#ifndef ENABLE_EDR_PRELOAD
+#define ENABLE_EDR_PRELOAD 0
+#endif
+
+#ifndef ENABLE_PPID_SPOOF
+#define ENABLE_PPID_SPOOF 0
+#endif
+
+#ifndef ENABLE_BLOCK_DLLS
+#define ENABLE_BLOCK_DLLS 0
+#endif
+
+#ifndef PPID_SPOOF_TARGET
+#define PPID_SPOOF_TARGET L"explorer.exe"
+#endif
+
+#ifndef ENABLE_CMDLINE_SPOOF
+#define ENABLE_CMDLINE_SPOOF 0
+#endif
 
 // ============================================================================
 // Pattern Scanner
