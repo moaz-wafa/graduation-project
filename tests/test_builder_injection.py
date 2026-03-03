@@ -29,11 +29,11 @@ def test_earlybird_injection_codegen():
 
 
 def test_earlycascade_injection_codegen():
-    """earlycascade inject → InjectEarlyCascade, AvrfpAPILookupCallbackRoutine, .mrdata in source."""
+    """earlycascade inject → InjectEarlyCascade, EncodeSystemPtr, .mrdata in source."""
     files = generate_files("earlycascade")
     ec = files["earlycascade.cpp"]
     assert "InjectEarlyCascade" in ec
-    assert "AvrfpAPILookupCallbackRoutine" in ec
+    assert "EncodeSystemPtr" in ec
     assert ".mrdata" in ec
 
 
