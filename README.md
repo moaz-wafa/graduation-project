@@ -1,5 +1,7 @@
 # ShadowGate v3.0
 
+[![CI – Python Tests](https://github.com/moaz-wafa/graduation-project/actions/workflows/tests.yml/badge.svg)](https://github.com/moaz-wafa/graduation-project/actions/workflows/tests.yml)
+
 **EDR/AV Evasion Research Framework — Graduation Project**
 
 > ⚠️ **Disclaimer:** This project is intended **for educational and authorized security research only**. Use only in environments you own or have explicit written permission to test. The authors assume no liability for misuse.
