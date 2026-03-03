@@ -45,9 +45,9 @@ def test_edr_preload_codegen():
     assert get_define_value(main, "ENABLE_EDR_PRELOAD") == "1"
     evasion = files["evasion.cpp"]
     assert "PerformEDRPreload" in evasion
-    # AvrfpAPILookupCallbackRoutine should appear in earlycascade.cpp (always generated)
+    # g_CascadeStub should appear in earlycascade.cpp (always generated)
     ec = files.get("earlycascade.cpp", "")
-    assert "AvrfpAPILookupCallbackRoutine" in ec
+    assert "g_CascadeStub" in ec
 
 
 def test_disable_preloaded_edr_codegen():
@@ -57,9 +57,9 @@ def test_disable_preloaded_edr_codegen():
     assert get_define_value(main, "ENABLE_DISABLE_PRELOADED_EDR") == "1"
     evasion_h = files["evasion.h"]
     assert "DisablePreloadedEdrModules" in evasion_h
-    # xor eax, eax gadget bytes appear in earlycascade.cpp
+    # g_StubPlaceholder bytes appear in earlycascade.cpp
     ec = files.get("earlycascade.cpp", "")
-    assert "0x33, 0xC0" in ec
+    assert "g_StubPlaceholder" in ec
 
 
 def test_freeze_codegen():
